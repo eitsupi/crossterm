@@ -117,10 +117,15 @@ pub(crate) fn window_size() -> io::Result<WindowSize> {
 
 /// Queries the terminal's support for progressive keyboard enhancement.
 ///
-/// This always returns `Ok(false)` on Windows.
+/// Windows conhost does not support the Kitty keyboard protocol, but
+/// Windows Terminal does as of Preview 1.25. Rather than issuing a
+/// blocking DA1/`?u` query, we detect Windows Terminal via the
+/// `WT_SESSION` environment variable, which the terminal sets in every
+/// hosted shell. Terminals that do not support the push sequence will
+/// silently ignore the unknown private CSI.
 #[cfg(feature = "events")]
 pub fn supports_keyboard_enhancement() -> std::io::Result<bool> {
-    Ok(false)
+    Ok(std::env::var_os("WT_SESSION").is_some())
 }
 
 pub(crate) fn clear(clear_type: ClearType) -> std::io::Result<()> {
