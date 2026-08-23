@@ -25,10 +25,14 @@ pub(crate) fn is_raw_mode_enabled() -> std::io::Result<bool> {
 
     let dw_mode = console_mode.mode()?;
 
-    Ok(
-        // check none of the "not raw" bits is set
-        dw_mode & NOT_RAW_MODE_MASK == 0,
-    )
+    Ok(is_raw_mode_from_console_mode(dw_mode))
+}
+
+/// Check raw-mode state from a mode value already obtained from the console.
+/// This avoids a second CONIN$ mode query in Windows event processing.
+pub(crate) fn is_raw_mode_from_console_mode(dw_mode: DWORD) -> bool {
+    // check none of the "not raw" bits is set
+    dw_mode & NOT_RAW_MODE_MASK == 0
 }
 
 /// Compute the console mode to apply when entering raw mode.

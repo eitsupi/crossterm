@@ -28,6 +28,28 @@ pub(crate) fn parse_event(
     buffer: &[u8],
     input_available: bool,
 ) -> io::Result<Option<InternalEvent>> {
+    parse_event_impl(buffer, input_available, None)
+}
+
+/// Parse an event using a caller-provided raw-mode state.
+///
+/// Windows obtains the mode once per input batch and uses this entry point to avoid
+/// reopening CONIN$ for every newline byte. The public internal parser entry point above
+/// retains its existing behavior for Unix and direct callers.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn parse_event_with_raw_mode(
+    buffer: &[u8],
+    input_available: bool,
+    raw_mode: bool,
+) -> io::Result<Option<InternalEvent>> {
+    parse_event_impl(buffer, input_available, Some(raw_mode))
+}
+
+fn parse_event_impl(
+    buffer: &[u8],
+    input_available: bool,
+    raw_mode: Option<bool>,
+) -> io::Result<Option<InternalEvent>> {
     if buffer.is_empty() {
         return Ok(None);
     }
@@ -74,19 +96,24 @@ pub(crate) fn parse_event(
                             }
                         }
                     }
-                    b'[' => parse_csi(buffer),
+                    b'[' => match raw_mode {
+                        Some(raw_mode) => parse_csi_impl(buffer, Some(raw_mode)),
+                        None => parse_csi(buffer),
+                    },
                     b'\x1B' => Ok(Some(InternalEvent::Event(Event::Key(KeyCode::Esc.into())))),
-                    _ => parse_event(&buffer[1..], input_available).map(|event_option| {
-                        event_option.map(|event| {
-                            if let InternalEvent::Event(Event::Key(key_event)) = event {
-                                let mut alt_key_event = key_event;
-                                alt_key_event.modifiers |= KeyModifiers::ALT;
-                                InternalEvent::Event(Event::Key(alt_key_event))
-                            } else {
-                                event
-                            }
-                        })
-                    }),
+                    _ => parse_event_impl(&buffer[1..], input_available, raw_mode).map(
+                        |event_option| {
+                            event_option.map(|event| {
+                                if let InternalEvent::Event(Event::Key(key_event)) = event {
+                                    let mut alt_key_event = key_event;
+                                    alt_key_event.modifiers |= KeyModifiers::ALT;
+                                    InternalEvent::Event(Event::Key(alt_key_event))
+                                } else {
+                                    event
+                                }
+                            })
+                        },
+                    ),
                 }
             }
         }
@@ -97,11 +124,14 @@ pub(crate) fn parse_event(
         // newlines as input is because the terminal converts \r into \n for us. When we
         // enter raw mode, we disable that, so \n no longer has any meaning - it's better to
         // use Ctrl+J. Waiting to handle it here means it gets picked up later
-        // unwrap_or(false): if the console mode query fails (possible on Windows),
-        // assume raw mode is enabled so \n is treated as Ctrl+J rather than Enter.
-        b'\n' if !crate::terminal::is_raw_mode_enabled().unwrap_or(false) => Ok(Some(
-            InternalEvent::Event(Event::Key(KeyCode::Enter.into())),
-        )),
+        b'\n'
+            if !raw_mode
+                .unwrap_or_else(|| crate::terminal::is_raw_mode_enabled().unwrap_or(true)) =>
+        {
+            Ok(Some(InternalEvent::Event(Event::Key(
+                KeyCode::Enter.into(),
+            ))))
+        }
         b'\t' => Ok(Some(InternalEvent::Event(Event::Key(KeyCode::Tab.into())))),
         b'\x7F' => Ok(Some(InternalEvent::Event(Event::Key(
             KeyCode::Backspace.into(),
@@ -138,6 +168,10 @@ fn char_code_to_event(code: KeyCode) -> KeyEvent {
 }
 
 pub(crate) fn parse_csi(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
+    parse_csi_impl(buffer, None)
+}
+
+fn parse_csi_impl(buffer: &[u8], raw_mode: Option<bool>) -> io::Result<Option<InternalEvent>> {
     assert!(buffer.starts_with(b"\x1B[")); // ESC [
 
     if buffer.len() == 2 {
@@ -203,7 +237,14 @@ pub(crate) fn parse_csi(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
                     match last_byte {
                         b'M' => return parse_csi_rxvt_mouse(buffer),
                         b'~' => return parse_csi_special_key_code(buffer),
-                        b'u' => return parse_csi_u_encoded_key_code(buffer),
+                        b'u' => {
+                            return match raw_mode {
+                                Some(raw_mode) => {
+                                    parse_csi_u_encoded_key_code_impl(buffer, Some(raw_mode))
+                                }
+                                None => parse_csi_u_encoded_key_code(buffer),
+                            };
+                        }
                         b'R' => return parse_csi_cursor_position(buffer),
                         _ => return parse_csi_modifier_key_code(buffer),
                     }
@@ -497,6 +538,13 @@ fn translate_functional_key_code(codepoint: u32) -> Option<(KeyCode, KeyEventSta
 }
 
 pub(crate) fn parse_csi_u_encoded_key_code(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
+    parse_csi_u_encoded_key_code_impl(buffer, None)
+}
+
+fn parse_csi_u_encoded_key_code_impl(
+    buffer: &[u8],
+    raw_mode: Option<bool>,
+) -> io::Result<Option<InternalEvent>> {
     assert!(buffer.starts_with(b"\x1B[")); // ESC [
     assert!(buffer.ends_with(b"u"));
 
@@ -551,8 +599,10 @@ pub(crate) fn parse_csi_u_encoded_key_code(buffer: &[u8]) -> io::Result<Option<I
                     // newlines as input is because the terminal converts \r into \n for us. When we
                     // enter raw mode, we disable that, so \n no longer has any meaning - it's better to
                     // use Ctrl+J. Waiting to handle it here means it gets picked up later
-                    // unwrap_or(false): see comment in parse_event for rationale
-                    '\n' if !crate::terminal::is_raw_mode_enabled().unwrap_or(false) => {
+                    '\n' if !raw_mode.unwrap_or_else(|| {
+                        crate::terminal::is_raw_mode_enabled().unwrap_or(true)
+                    }) =>
+                    {
                         KeyCode::Enter
                     }
                     '\t' => {
@@ -1009,6 +1059,45 @@ mod tests {
         assert_eq!(
             parse_event(b"\t", false).unwrap(),
             Some(InternalEvent::Event(Event::Key(KeyCode::Tab.into()))),
+        );
+    }
+
+    #[test]
+    fn test_parse_event_with_explicit_raw_mode_newline() {
+        assert_eq!(
+            parse_event_with_raw_mode(b"\n", false, false).unwrap(),
+            Some(InternalEvent::Event(Event::Key(KeyCode::Enter.into())))
+        );
+        assert_eq!(
+            parse_event_with_raw_mode(b"\n", false, true).unwrap(),
+            Some(InternalEvent::Event(Event::Key(KeyEvent::new(
+                KeyCode::Char('j'),
+                KeyModifiers::CONTROL,
+            ))))
+        );
+    }
+
+    #[test]
+    fn test_parse_csi_u_newline_with_explicit_raw_mode() {
+        assert_eq!(
+            parse_event_with_raw_mode(b"\x1B[10;1u", false, false).unwrap(),
+            Some(InternalEvent::Event(Event::Key(KeyCode::Enter.into())))
+        );
+        assert_eq!(
+            parse_event_with_raw_mode(b"\x1B[10;1u", false, true).unwrap(),
+            Some(InternalEvent::Event(Event::Key(KeyEvent::new(
+                KeyCode::Char('\n'),
+                KeyModifiers::empty(),
+            ))))
+        );
+    }
+
+    #[cfg(feature = "bracketed-paste")]
+    #[test]
+    fn test_bracketed_paste_newline_payload_ignores_raw_mode() {
+        assert_eq!(
+            parse_event_with_raw_mode(b"\x1B[200~line\ntext\x1B[201~", false, true).unwrap(),
+            Some(InternalEvent::Event(Event::Paste("line\ntext".to_string())))
         );
     }
 
@@ -1682,6 +1771,16 @@ impl Default for Parser {
 
 impl Parser {
     pub(crate) fn advance(&mut self, buffer: &[u8], more: bool) {
+        self.advance_impl(buffer, more, None);
+    }
+
+    /// Advance the parser using the raw-mode state captured for a Windows input batch.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn advance_with_raw_mode(&mut self, buffer: &[u8], more: bool, raw_mode: bool) {
+        self.advance_impl(buffer, more, Some(raw_mode));
+    }
+
+    fn advance_impl(&mut self, buffer: &[u8], more: bool, raw_mode: Option<bool>) {
         for (idx, byte) in buffer.iter().enumerate() {
             let more = idx + 1 < buffer.len() || more;
 
@@ -1690,7 +1789,11 @@ impl Parser {
             }
             self.buffer.push(*byte);
 
-            match parse_event(&self.buffer, more) {
+            let parsed = match raw_mode {
+                Some(raw_mode) => parse_event_impl(&self.buffer, more, Some(raw_mode)),
+                None => parse_event(&self.buffer, more),
+            };
+            match parsed {
                 Ok(Some(ie)) => {
                     self.insert_buffered_event(ie);
                     self.buffer.clear();
@@ -1715,7 +1818,7 @@ impl Parser {
 
     /// Push a non-ANSI event directly into the event queue.
     /// Used by the Windows hybrid source for events that bypass ANSI parsing.
-    #[allow(dead_code)]
+    #[cfg_attr(unix, allow(dead_code))]
     pub(crate) fn push_event(&mut self, event: InternalEvent) {
         self.internal_events.push_back(event);
     }
@@ -1746,12 +1849,26 @@ impl Parser {
     /// If `parse_event` still returns `Ok(None)` with `more=false` (genuinely
     /// incomplete multi-byte sequence such as `ESC [`), the buffer is left intact so
     /// the remaining bytes can be completed by subsequent input.
-    #[allow(dead_code)]
+    #[cfg_attr(unix, allow(dead_code))]
     pub(crate) fn flush(&mut self) {
+        self.flush_impl(None);
+    }
+
+    /// Flush using the raw-mode state captured for a Windows input batch.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn flush_with_raw_mode(&mut self, raw_mode: bool) {
+        self.flush_impl(Some(raw_mode));
+    }
+
+    fn flush_impl(&mut self, raw_mode: Option<bool>) {
         if self.buffer.is_empty() {
             return;
         }
-        match parse_event(&self.buffer, false) {
+        let parsed = match raw_mode {
+            Some(raw_mode) => parse_event_impl(&self.buffer, false, Some(raw_mode)),
+            None => parse_event(&self.buffer, false),
+        };
+        match parsed {
             Ok(Some(ie)) => {
                 self.insert_buffered_event(ie);
                 self.buffer.clear();
@@ -1791,7 +1908,7 @@ impl Iterator for Parser {
 /// Returns `Some(char)` for BMP characters and completed surrogate pairs.
 /// Returns `None` when a high surrogate is buffered (waiting for its low half)
 /// or when an orphaned low surrogate is encountered.
-#[allow(dead_code)]
+#[cfg_attr(unix, allow(dead_code))]
 pub(crate) fn decode_utf16_char(surrogate_buffer: &mut Option<u16>, utf16: u16) -> Option<char> {
     if (0xD800..=0xDBFF).contains(&utf16) {
         // High surrogate — store and wait for low surrogate

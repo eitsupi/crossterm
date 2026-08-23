@@ -78,9 +78,10 @@ impl EventSource for WindowsEventSource {
                     // lifecycle never routes records using stale VT state.  Mode-query errors
                     // are propagated because silently selecting the VK path could misdecode a
                     // batch that was actually produced in VT mode.
-                    let vt_input_enabled = self.console_mode.mode().map(|mode| {
-                        mode & crate::event::sys::windows::ENABLE_VIRTUAL_TERMINAL_INPUT != 0
-                    })?;
+                    let mode = self.console_mode.mode()?;
+                    let vt_input_enabled =
+                        mode & crate::event::sys::windows::ENABLE_VIRTUAL_TERMINAL_INPUT != 0;
+                    let raw_mode = crate::terminal::sys::is_raw_mode_from_console_mode(mode);
 
                     // Process all available input records as a batch.
                     // Batch reading is essential for VT mode because ANSI escape
@@ -122,8 +123,11 @@ impl EventSource for WindowsEventSource {
                                         } else {
                                             self.console.number_of_console_input_events()? > 0
                                         };
-                                        self.parser
-                                            .advance(encoded.as_bytes(), more_input_available);
+                                        self.parser.advance_with_raw_mode(
+                                            encoded.as_bytes(),
+                                            more_input_available,
+                                            raw_mode,
+                                        );
                                     }
                                 } else {
                                     // Non-VT fallback: use existing VK code handling.  This is
@@ -176,7 +180,7 @@ impl EventSource for WindowsEventSource {
                     //      buffered sequence won't be completed by a subsequent batch, so
                     //      force-emit it rather than leaving it stuck indefinitely.
                     if !vt_bytes_consumed || self.console.number_of_console_input_events()? == 0 {
-                        self.parser.flush();
+                        self.parser.flush_with_raw_mode(raw_mode);
                     }
 
                     // Return first available event from the batch
