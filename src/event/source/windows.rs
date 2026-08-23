@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crossterm_winapi::{Console, Handle, InputRecord};
+use crossterm_winapi::{Console, ConsoleMode, Handle, InputRecord};
 
 use crate::event::{
     Event,
@@ -8,7 +8,6 @@ use crate::event::{
         parse::MouseButtonsPressed,
         parse::{handle_key_event, handle_mouse_event},
         poll::WinApiPoll,
-        try_enable_vt_input,
     },
 };
 
@@ -32,13 +31,19 @@ pub(crate) struct WindowsEventSource {
     legacy_surrogate: Option<u16>,
     mouse_buttons_pressed: MouseButtonsPressed,
     parser: Parser,
-    vt_input_enabled: bool,
+    /// Console mode for the same CONIN$ handle used by `console`.
+    ///
+    /// Keeping this handle alongside the input reader avoids opening and closing CONIN$ for
+    /// every mode query.  The mode is intentionally queried once per input batch, rather than
+    /// cached for the lifetime of the event source: raw mode can be toggled between batches.
+    console_mode: ConsoleMode,
 }
 
 impl WindowsEventSource {
     pub(crate) fn new() -> std::io::Result<WindowsEventSource> {
-        let console = Console::from(Handle::current_in_handle()?);
-        let vt_input_enabled = try_enable_vt_input()?;
+        let input_handle = Handle::current_in_handle()?;
+        let console = Console::from(input_handle.clone());
+        let console_mode = ConsoleMode::from(input_handle);
         Ok(WindowsEventSource {
             console,
 
@@ -51,7 +56,7 @@ impl WindowsEventSource {
             legacy_surrogate: None,
             mouse_buttons_pressed: MouseButtonsPressed::default(),
             parser: Parser::default(),
-            vt_input_enabled,
+            console_mode,
         })
     }
 }
@@ -67,22 +72,34 @@ impl EventSource for WindowsEventSource {
 
         loop {
             if let Some(event_ready) = self.poll.poll(poll_timeout.leftover())? {
-                let number = self.console.number_of_console_input_events()?;
-                if event_ready && number != 0 {
+                if event_ready {
+                    // Raw mode may have been enabled or disabled since the last call.  Query
+                    // the mode of the same handle used to read this batch, so the event
+                    // lifecycle never routes records using stale VT state.  Mode-query errors
+                    // are propagated because silently selecting the VK path could misdecode a
+                    // batch that was actually produced in VT mode.
+                    let vt_input_enabled = self.console_mode.mode().map(|mode| {
+                        mode & crate::event::sys::windows::ENABLE_VIRTUAL_TERMINAL_INPUT != 0
+                    })?;
+
                     // Process all available input records as a batch.
                     // Batch reading is essential for VT mode because ANSI escape
                     // sequences are spread across multiple KEY_EVENT records.
-                    // Note: `number` is read once before the loop. The count can
-                    // become stale while we process the batch, so don't rely on
-                    // `remaining > 0` alone to decide whether more bytes are
-                    // immediately available for ANSI parsing.
-                    let mut remaining = number;
+                    // `read_console_input` snapshots the queue and returns only the records
+                    // actually read.  This removes the per-record race introduced by repeatedly
+                    // reading `number` single records; the API still has the same race as the
+                    // master branch if another reader drains the whole queue before this call.
+                    let input_records = self.console.read_console_input()?;
+                    if input_records.is_empty() {
+                        continue;
+                    }
+
+                    let batch_len = input_records.len();
                     let mut vt_bytes_consumed = false;
-                    for _ in 0..number {
-                        remaining -= 1;
-                        match self.console.read_single_input_event()? {
+                    for (index, record) in input_records.into_iter().enumerate() {
+                        match record {
                             InputRecord::KeyEvent(record) => {
-                                if self.vt_input_enabled && record.u_char != 0 && record.key_down {
+                                if vt_input_enabled && record.u_char != 0 && record.key_down {
                                     vt_bytes_consumed = true;
                                     // VT path: feed unicode character to ANSI parser as UTF-8.
                                     // With ENABLE_VIRTUAL_TERMINAL_INPUT, special keys produce
@@ -100,7 +117,7 @@ impl EventSource for WindowsEventSource {
                                         // boundaries. If this is the last record in the current
                                         // snapshot, probe the console queue once more before
                                         // deciding that no additional bytes are pending.
-                                        let more_input_available = if remaining > 0 {
+                                        let more_input_available = if index + 1 < batch_len {
                                             true
                                         } else {
                                             self.console.number_of_console_input_events()? > 0
@@ -108,20 +125,17 @@ impl EventSource for WindowsEventSource {
                                         self.parser
                                             .advance(encoded.as_bytes(), more_input_available);
                                     }
-                                } else if !self.vt_input_enabled || record.u_char == 0 {
-                                    // Non-VT fallback: use existing VK code handling.
-                                    // When VT is enabled, keys with u_char==0 (e.g. standalone
-                                    // modifier presses) still need VK code handling.
+                                } else {
+                                    // Non-VT fallback: use existing VK code handling.  This is
+                                    // also required for VT batches when the record is a key-up
+                                    // event or has no Unicode character: handle_key_event keeps
+                                    // release events and Alt-code records intact.
                                     if let Some(event) =
                                         handle_key_event(record, &mut self.legacy_surrogate)
                                     {
                                         self.parser.push_event(InternalEvent::Event(event));
                                     }
                                 }
-                                // VT enabled, key_down=false, u_char!=0: intentionally
-                                // skipped. Release events don't carry new ANSI data, and
-                                // crossterm only reports key-press events. In non-VT mode,
-                                // handle_key_event would also discard most key-up events.
                             }
                             InputRecord::MouseEvent(record) => {
                                 let mouse_event =

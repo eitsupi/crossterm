@@ -70,7 +70,13 @@ pub(crate) fn enable_raw_mode() -> std::io::Result<()> {
     let dw_mode = console_mode.mode()?;
 
     #[cfg(feature = "events")]
-    let original = crate::event::sys::windows::original_console_mode().ok();
+    let original = {
+        // Capture the mode immediately before crossterm starts changing it.  Event-source
+        // construction must remain side-effect free, so raw-mode entry is the first place
+        // where this snapshot is normally initialized.
+        crate::event::sys::windows::init_original_console_mode(dw_mode);
+        crate::event::sys::windows::original_console_mode().ok()
+    };
     #[cfg(not(feature = "events"))]
     let original: Option<DWORD> = None;
 
@@ -564,7 +570,8 @@ mod tests {
 
     #[test]
     fn test_compute_enable_raw_mode_no_panic_when_original_unknown() {
-        // original_console_mode() can fail if called before any event reader init.
+        // Exercise the pure helper's None behavior. With events enabled, the real
+        // enable_raw_mode path initializes the original mode before calling it.
         let current = BASE_MODE | NOT_RAW_MODE_MASK;
         let result = compute_enable_raw_mode(current, None);
         assert_eq!(result & NOT_RAW_MODE_MASK, 0);
