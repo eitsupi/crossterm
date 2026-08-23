@@ -1647,6 +1647,12 @@ mod tests {
 pub(crate) struct Parser {
     buffer: Vec<u8>,
     internal_events: VecDeque<InternalEvent>,
+    /// Queue index where the current ANSI sequence started.
+    ///
+    /// Events parsed after an incomplete sequence is buffered are appended to the queue, but
+    /// must remain after the sequence when it eventually becomes an event. The index is adjusted
+    /// when callers consume events before the buffered sequence.
+    buffer_event_position: usize,
 }
 
 impl Default for Parser {
@@ -1669,6 +1675,7 @@ impl Default for Parser {
             // method implementation, all events are consumed before the next TTY_BUFFER
             // is processed -> events pushed.
             internal_events: VecDeque::with_capacity(128),
+            buffer_event_position: 0,
         }
     }
 }
@@ -1678,11 +1685,14 @@ impl Parser {
         for (idx, byte) in buffer.iter().enumerate() {
             let more = idx + 1 < buffer.len() || more;
 
+            if self.buffer.is_empty() {
+                self.buffer_event_position = self.internal_events.len();
+            }
             self.buffer.push(*byte);
 
             match parse_event(&self.buffer, more) {
                 Ok(Some(ie)) => {
-                    self.internal_events.push_back(ie);
+                    self.insert_buffered_event(ie);
                     self.buffer.clear();
                 }
                 Ok(None) => {
@@ -1696,6 +1706,11 @@ impl Parser {
                 }
             }
         }
+    }
+
+    fn insert_buffered_event(&mut self, event: InternalEvent) {
+        let position = self.buffer_event_position.min(self.internal_events.len());
+        self.internal_events.insert(position, event);
     }
 
     /// Push a non-ANSI event directly into the event queue.
@@ -1724,9 +1739,9 @@ impl Parser {
     ///
     /// Call this after processing a batch that contained no VT key bytes to prevent
     /// a lone ESC from being held indefinitely when the only pending console records
-    /// are non-key events (mouse, focus, resize).  The emitted event is prepended to
-    /// the queue so that temporal ordering is preserved: the ESC key press happened
-    /// before the interleaved mouse/focus events that caused the delay.
+    /// are non-key events (mouse, focus, resize). The emitted event is inserted where
+    /// the ANSI sequence began so temporal ordering is preserved even when an earlier
+    /// event has already been queued.
     ///
     /// If `parse_event` still returns `Ok(None)` with `more=false` (genuinely
     /// incomplete multi-byte sequence such as `ESC [`), the buffer is left intact so
@@ -1738,9 +1753,7 @@ impl Parser {
         }
         match parse_event(&self.buffer, false) {
             Ok(Some(ie)) => {
-                // Prepend so the ESC appears before any non-key events that were
-                // push_back'd during the same batch.
-                self.internal_events.push_front(ie);
+                self.insert_buffered_event(ie);
                 self.buffer.clear();
             }
             Ok(None) => {
@@ -1759,7 +1772,17 @@ impl Iterator for Parser {
     type Item = InternalEvent;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.internal_events.pop_front()
+        // A pending ANSI sequence at position zero precedes every queued event. Do not
+        // expose events that arrived after it until the sequence is completed or flushed.
+        if !self.buffer.is_empty() && self.buffer_event_position == 0 {
+            return None;
+        }
+
+        let event = self.internal_events.pop_front();
+        if event.is_some() && !self.buffer.is_empty() && self.buffer_event_position > 0 {
+            self.buffer_event_position -= 1;
+        }
+        event
     }
 }
 
@@ -1823,6 +1846,94 @@ mod parser_flush_tests {
             "ESC must appear before FocusGained"
         );
         assert_eq!(p.next(), Some(focus_gained_event()));
+        assert!(p.next().is_none());
+    }
+
+    #[test]
+    fn test_flush_preserves_position_after_prior_event() {
+        let mut p = Parser::default();
+        p.push_event(focus_gained_event());
+        p.advance(b"\x1B", true); // held after FocusGained
+        p.push_event(InternalEvent::Event(Event::Key(KeyCode::Enter.into())));
+        p.flush();
+
+        assert_eq!(p.next(), Some(focus_gained_event()));
+        assert_eq!(p.next(), Some(esc_event()));
+        assert_eq!(
+            p.next(),
+            Some(InternalEvent::Event(Event::Key(KeyCode::Enter.into())))
+        );
+        assert!(p.next().is_none());
+    }
+
+    #[test]
+    fn test_pending_sequence_at_queue_front_blocks_later_event() {
+        let mut p = Parser::default();
+        p.advance(b"\x1B", true);
+        p.push_event(focus_gained_event());
+
+        assert!(p.next().is_none());
+        assert!(p.next_event().is_none());
+
+        p.flush();
+        assert_eq!(p.next(), Some(esc_event()));
+        assert_eq!(p.next(), Some(focus_gained_event()));
+    }
+
+    #[test]
+    fn test_pending_sequence_after_prior_event_blocks_only_later_events() {
+        let mut p = Parser::default();
+        p.push_event(focus_gained_event());
+        p.advance(b"\x1B", true);
+        p.push_event(InternalEvent::Event(Event::Key(KeyCode::Enter.into())));
+
+        assert_eq!(p.next(), Some(focus_gained_event()));
+        assert!(p.next().is_none());
+        assert!(p.next_event().is_none());
+
+        p.flush();
+        assert_eq!(p.next(), Some(esc_event()));
+        assert_eq!(
+            p.next(),
+            Some(InternalEvent::Event(Event::Key(KeyCode::Enter.into())))
+        );
+    }
+
+    #[test]
+    fn test_buffered_ansi_event_is_inserted_at_sequence_position() {
+        let mut p = Parser::default();
+        p.push_event(focus_gained_event());
+        p.advance(b"\x1B[", true); // incomplete CSI
+        p.push_event(InternalEvent::Event(Event::Key(KeyCode::Enter.into())));
+        p.advance(b"A", false); // complete Up sequence
+
+        assert_eq!(p.next(), Some(focus_gained_event()));
+        assert_eq!(
+            p.next(),
+            Some(InternalEvent::Event(Event::Key(KeyCode::Up.into())))
+        );
+        assert_eq!(
+            p.next(),
+            Some(InternalEvent::Event(Event::Key(KeyCode::Enter.into())))
+        );
+        assert!(p.next().is_none());
+    }
+
+    #[test]
+    fn test_flush_position_tracks_consumed_prefix() {
+        let mut p = Parser::default();
+        p.push_event(focus_gained_event());
+        p.advance(b"\x1B", true);
+        p.push_event(InternalEvent::Event(Event::Key(KeyCode::Enter.into())));
+
+        // Consuming the event before the buffered sequence moves its insertion point to zero.
+        assert_eq!(p.next(), Some(focus_gained_event()));
+        p.flush();
+        assert_eq!(p.next(), Some(esc_event()));
+        assert_eq!(
+            p.next(),
+            Some(InternalEvent::Event(Event::Key(KeyCode::Enter.into())))
+        );
         assert!(p.next().is_none());
     }
 
