@@ -1705,6 +1705,21 @@ impl Parser {
         self.internal_events.push_back(event);
     }
 
+    /// Return the next public event, discarding parser output that has no Windows consumer.
+    ///
+    /// The ANSI parser also recognizes terminal responses such as cursor position reports and
+    /// keyboard enhancement flags. Those are useful to Unix-side consumers, but Windows' event
+    /// source cannot deliver them and must not leave them in the shared reader queue.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn next_event(&mut self) -> Option<InternalEvent> {
+        while let Some(event) = self.next() {
+            if matches!(event, InternalEvent::Event(_)) {
+                return Some(event);
+            }
+        }
+        None
+    }
+
     /// Attempt to emit any buffered bytes as a complete event with `more=false`.
     ///
     /// Call this after processing a batch that contained no VT key bytes to prevent
@@ -1828,6 +1843,28 @@ mod parser_flush_tests {
     fn test_flush_empty_buffer_is_noop() {
         let mut p = Parser::default();
         p.flush();
+        assert!(p.next().is_none());
+    }
+
+    #[test]
+    fn test_next_event_discards_non_events_before_event() {
+        let mut p = Parser::default();
+        p.push_event(InternalEvent::CursorPosition(4, 2));
+        p.push_event(focus_gained_event());
+
+        assert_eq!(p.next_event(), Some(focus_gained_event()));
+        assert!(p.next_event().is_none());
+    }
+
+    #[test]
+    fn test_next_event_discards_non_events_when_no_event_follows() {
+        let mut p = Parser::default();
+        p.push_event(InternalEvent::PrimaryDeviceAttributes);
+        p.push_event(InternalEvent::KeyboardEnhancementFlags(
+            crate::event::KeyboardEnhancementFlags::empty(),
+        ));
+
+        assert!(p.next_event().is_none());
         assert!(p.next().is_none());
     }
 }

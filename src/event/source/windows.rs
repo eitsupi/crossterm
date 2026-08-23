@@ -64,7 +64,7 @@ impl WindowsEventSource {
 impl EventSource for WindowsEventSource {
     fn try_read(&mut self, timeout: Option<Duration>) -> std::io::Result<Option<InternalEvent>> {
         // Return buffered events first
-        if let Some(event) = self.parser.next() {
+        if let Some(event) = self.parser.next_event() {
             return Ok(Some(event));
         }
 
@@ -180,7 +180,7 @@ impl EventSource for WindowsEventSource {
                     }
 
                     // Return first available event from the batch
-                    if let Some(event) = self.parser.next() {
+                    if let Some(event) = self.parser.next_event() {
                         return Ok(Some(event));
                     }
                 }
