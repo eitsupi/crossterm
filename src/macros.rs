@@ -266,9 +266,9 @@ mod tests {
 
     #[cfg(windows)]
     mod windows {
-        use std::fmt;
-
         use std::cell::RefCell;
+        use std::fmt;
+        use std::rc::Rc;
 
         use super::FakeWrite;
         use crate::command::Command;
@@ -307,6 +307,116 @@ mod tests {
                 self.stream.borrow_mut().push(self.value);
                 Ok(())
             }
+        }
+
+        struct OrderedWrite {
+            buffer: String,
+            log: Rc<RefCell<Vec<&'static str>>>,
+        }
+
+        impl std::io::Write for OrderedWrite {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.log.borrow_mut().push("ansi");
+                self.buffer.push_str(std::str::from_utf8(bytes).unwrap());
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.log.borrow_mut().push("flush");
+                Ok(())
+            }
+        }
+
+        struct OrderedCommand {
+            log: Rc<RefCell<Vec<&'static str>>>,
+            ansi_supported: bool,
+            winapi_before_ansi: bool,
+            winapi_error: bool,
+        }
+
+        impl Command for OrderedCommand {
+            fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+                f.write_str("ansi")
+            }
+
+            fn execute_winapi(&self) -> std::io::Result<()> {
+                self.log.borrow_mut().push("winapi");
+                if self.winapi_error {
+                    Err(std::io::Error::other("test WinAPI failure"))
+                } else {
+                    Ok(())
+                }
+            }
+
+            fn is_ansi_code_supported(&self) -> bool {
+                self.ansi_supported
+            }
+
+            fn execute_winapi_before_ansi(&self) -> bool {
+                self.winapi_before_ansi
+            }
+        }
+
+        fn ordered_command(
+            log: &Rc<RefCell<Vec<&'static str>>>,
+            ansi_supported: bool,
+            winapi_before_ansi: bool,
+            winapi_error: bool,
+        ) -> OrderedCommand {
+            OrderedCommand {
+                log: Rc::clone(log),
+                ansi_supported,
+                winapi_before_ansi,
+                winapi_error,
+            }
+        }
+
+        #[test]
+        fn test_queue_unsupported_uses_winapi_only() {
+            let log = Rc::new(RefCell::new(Vec::new()));
+            let mut writer = OrderedWrite {
+                buffer: String::new(),
+                log: Rc::clone(&log),
+            };
+            queue!(&mut writer, ordered_command(&log, false, true, false)).unwrap();
+            assert_eq!(writer.buffer, "");
+            assert_eq!(&*log.borrow(), &["flush", "winapi"]);
+        }
+
+        #[test]
+        fn test_queue_supported_without_hook_uses_ansi_only() {
+            let log = Rc::new(RefCell::new(Vec::new()));
+            let mut writer = OrderedWrite {
+                buffer: String::new(),
+                log: Rc::clone(&log),
+            };
+            queue!(&mut writer, ordered_command(&log, true, false, false)).unwrap();
+            assert_eq!(writer.buffer, "ansi");
+            assert_eq!(&*log.borrow(), &["ansi"]);
+        }
+
+        #[test]
+        fn test_queue_hook_flushes_winapi_then_queues_ansi() {
+            let log = Rc::new(RefCell::new(Vec::new()));
+            let mut writer = OrderedWrite {
+                buffer: "buffered".to_string(),
+                log: Rc::clone(&log),
+            };
+            queue!(&mut writer, ordered_command(&log, true, true, false)).unwrap();
+            assert_eq!(writer.buffer, "bufferedansi");
+            assert_eq!(&*log.borrow(), &["flush", "winapi", "ansi"]);
+        }
+
+        #[test]
+        fn test_queue_hook_error_does_not_write_ansi() {
+            let log = Rc::new(RefCell::new(Vec::new()));
+            let mut writer = OrderedWrite {
+                buffer: "buffered".to_string(),
+                log: Rc::clone(&log),
+            };
+            assert!(queue!(&mut writer, ordered_command(&log, true, true, true)).is_err());
+            assert_eq!(writer.buffer, "buffered");
+            assert_eq!(&*log.borrow(), &["flush", "winapi"]);
         }
 
         // Helper function for running tests against either WinAPI or an

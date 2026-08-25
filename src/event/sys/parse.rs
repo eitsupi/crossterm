@@ -36,7 +36,7 @@ pub(crate) fn parse_event(
 /// Windows obtains the mode once per input batch and uses this entry point to avoid
 /// reopening CONIN$ for every newline byte. The public internal parser entry point above
 /// retains its existing behavior for Unix and direct callers.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 pub(crate) fn parse_event_with_raw_mode(
     buffer: &[u8],
     input_available: bool,
@@ -1770,6 +1770,7 @@ impl Default for Parser {
 }
 
 impl Parser {
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn advance(&mut self, buffer: &[u8], more: bool) {
         self.advance_impl(buffer, more, None);
     }
@@ -1830,12 +1831,7 @@ impl Parser {
     /// source cannot deliver them and must not leave them in the shared reader queue.
     #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn next_event(&mut self) -> Option<InternalEvent> {
-        while let Some(event) = self.next() {
-            if matches!(event, InternalEvent::Event(_)) {
-                return Some(event);
-            }
-        }
-        None
+        self.find(|event| matches!(event, InternalEvent::Event(_)))
     }
 
     /// Attempt to emit any buffered bytes as a complete event with `more=false`.
@@ -1849,7 +1845,7 @@ impl Parser {
     /// If `parse_event` still returns `Ok(None)` with `more=false` (genuinely
     /// incomplete multi-byte sequence such as `ESC [`), the buffer is left intact so
     /// the remaining bytes can be completed by subsequent input.
-    #[cfg_attr(unix, allow(dead_code))]
+    #[allow(dead_code)]
     pub(crate) fn flush(&mut self) {
         self.flush_impl(None);
     }

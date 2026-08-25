@@ -304,6 +304,7 @@ pub struct EnableMouseCapture;
 
 #[cfg(feature = "events")]
 impl Command for EnableMouseCapture {
+    #[cfg(not(windows))]
     fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
         f.write_str(concat!(
             // Normal tracking: Send mouse X & Y on button press and release
@@ -320,13 +321,23 @@ impl Command for EnableMouseCapture {
     }
 
     #[cfg(windows)]
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        // ConPTY translates ENABLE_MOUSE_INPUT into these two requests (Microsoft Terminal
+        // PR #9970). Keep the Win32 capture enabled for conhost and queue the VT representation
+        // for ConPTY passthrough; this is a hybrid bridge, not a Windows Terminal workaround.
+        // Microsoft Terminal issue #15296 documents why the application must provide the VT side
+        // while ENABLE_VIRTUAL_TERMINAL_INPUT is active.
+        f.write_str(concat!(csi!("?1003;1006h")))
+    }
+
+    #[cfg(windows)]
     fn execute_winapi(&self) -> std::io::Result<()> {
         sys::windows::enable_mouse_capture()
     }
 
     #[cfg(windows)]
-    fn is_ansi_code_supported(&self) -> bool {
-        false
+    fn execute_winapi_before_ansi(&self) -> bool {
+        true
     }
 }
 
@@ -337,6 +348,7 @@ impl Command for EnableMouseCapture {
 pub struct DisableMouseCapture;
 
 impl Command for DisableMouseCapture {
+    #[cfg(not(windows))]
     fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
         f.write_str(concat!(
             // The inverse commands of EnableMouseCapture, in reverse order.
@@ -349,13 +361,19 @@ impl Command for DisableMouseCapture {
     }
 
     #[cfg(windows)]
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        // Reverse the same ConPTY-compatible requests used by EnableMouseCapture.
+        f.write_str(concat!(csi!("?1003;1006l")))
+    }
+
+    #[cfg(windows)]
     fn execute_winapi(&self) -> std::io::Result<()> {
         sys::windows::disable_mouse_capture()
     }
 
     #[cfg(windows)]
-    fn is_ansi_code_supported(&self) -> bool {
-        false
+    fn execute_winapi_before_ansi(&self) -> bool {
+        true
     }
 }
 

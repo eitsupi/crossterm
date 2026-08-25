@@ -34,6 +34,18 @@ pub trait Command {
     fn is_ansi_code_supported(&self) -> bool {
         super::ansi_support::supports_ansi()
     }
+
+    /// Whether this command must execute its Win32 side effect before writing ANSI.
+    ///
+    /// This is hidden from generated documentation and used only by the internal execution
+    /// path. A small number of Windows commands represent one operation in both the console mode
+    /// and terminal protocol, so they need to preserve the Win32 fallback while also queueing
+    /// their ANSI representation.
+    #[cfg(windows)]
+    #[doc(hidden)]
+    fn execute_winapi_before_ansi(&self) -> bool {
+        false
+    }
 }
 
 impl<T: Command + ?Sized> Command for &T {
@@ -51,6 +63,12 @@ impl<T: Command + ?Sized> Command for &T {
     #[inline]
     fn is_ansi_code_supported(&self) -> bool {
         T::is_ansi_code_supported(self)
+    }
+
+    #[cfg(windows)]
+    #[inline]
+    fn execute_winapi_before_ansi(&self) -> bool {
+        T::execute_winapi_before_ansi(self)
     }
 }
 
@@ -120,13 +138,24 @@ impl<T: Write + ?Sized> QueueableCommand for T {
     ///   and [queue](./trait.QueueableCommand.html) for those old Windows versions.
     fn queue(&mut self, command: impl Command) -> io::Result<&mut Self> {
         #[cfg(windows)]
-        if !command.is_ansi_code_supported() {
-            // There may be queued commands in this writer, but `execute_winapi` will execute the
-            // command immediately. To prevent commands being executed out of order we flush the
-            // writer now.
-            self.flush()?;
-            command.execute_winapi()?;
-            return Ok(self);
+        {
+            let ansi_supported = command.is_ansi_code_supported();
+            if ansi_supported && command.execute_winapi_before_ansi() {
+                // Keep the Win32 operation ahead of the ANSI bytes, including bytes already
+                // queued in this writer. This is required for commands that bridge both
+                // representations.
+                self.flush()?;
+                command.execute_winapi()?;
+                write_command_ansi(self, command)?;
+                return Ok(self);
+            } else if !ansi_supported {
+                // There may be queued commands in this writer, but `execute_winapi` will execute
+                // the command immediately. To prevent commands being executed out of order we
+                // flush the writer now.
+                self.flush()?;
+                command.execute_winapi()?;
+                return Ok(self);
+            }
         }
 
         write_command_ansi(self, command)?;
@@ -289,6 +318,11 @@ pub(crate) fn execute_fmt(f: &mut impl fmt::Write, command: impl Command) -> fmt
     #[cfg(windows)]
     if !command.is_ansi_code_supported() {
         return command.execute_winapi().map_err(|_| fmt::Error);
+    }
+
+    #[cfg(windows)]
+    if command.execute_winapi_before_ansi() {
+        command.execute_winapi().map_err(|_| fmt::Error)?;
     }
 
     command.write_ansi(f)

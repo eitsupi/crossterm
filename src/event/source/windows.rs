@@ -3,7 +3,7 @@ use std::time::Duration;
 use crossterm_winapi::{Console, ConsoleMode, Handle, InputRecord};
 
 use crate::event::{
-    Event,
+    Event, KeyModifiers,
     sys::windows::{
         parse::MouseButtonsPressed,
         parse::{handle_key_event, handle_mouse_event},
@@ -30,6 +30,10 @@ pub(crate) struct WindowsEventSource {
     /// single batch: VT path for u_char != 0 events, non-VT for u_char == 0.
     legacy_surrogate: Option<u16>,
     mouse_buttons_pressed: MouseButtonsPressed,
+    /// Candidate character from conhost's packet release, awaiting the immediately adjacent
+    /// duplicate VT character record. The source clears this on every non-key record and mode
+    /// transition; it is deliberately a finite record-state check, not a timing heuristic.
+    alt_numpad_pending: Option<u16>,
     parser: Parser,
     /// Console mode for the same CONIN$ handle used by `console`.
     ///
@@ -55,6 +59,7 @@ impl WindowsEventSource {
             vt_surrogate: None,
             legacy_surrogate: None,
             mouse_buttons_pressed: MouseButtonsPressed::default(),
+            alt_numpad_pending: None,
             parser: Parser::default(),
             console_mode,
         })
@@ -82,6 +87,11 @@ impl EventSource for WindowsEventSource {
                     let vt_input_enabled =
                         mode & crate::event::sys::windows::ENABLE_VIRTUAL_TERMINAL_INPUT != 0;
                     let raw_mode = crate::terminal::sys::is_raw_mode_from_console_mode(mode);
+                    if !vt_input_enabled {
+                        // The candidate is meaningful only while the VT/Win32 hybrid route is
+                        // active. A raw-mode toggle must not carry it into the legacy path.
+                        self.alt_numpad_pending = None;
+                    }
 
                     // Process all available input records as a batch.
                     // Batch reading is essential for VT mode because ANSI escape
@@ -100,6 +110,19 @@ impl EventSource for WindowsEventSource {
                     for (index, record) in input_records.into_iter().enumerate() {
                         match record {
                             InputRecord::KeyEvent(record) => {
+                                let suppress_alt_numpad = vt_input_enabled
+                                    && parse::suppress_alt_numpad_duplicate(
+                                        &mut self.alt_numpad_pending,
+                                        record.virtual_key_code as u16,
+                                        record.key_down,
+                                        record.u_char,
+                                        KeyModifiers::from(&record.control_key_state)
+                                            .contains(KeyModifiers::ALT),
+                                    );
+                                if suppress_alt_numpad {
+                                    continue;
+                                }
+
                                 if vt_input_enabled && record.u_char != 0 && record.key_down {
                                     vt_bytes_consumed = true;
                                     // VT path: feed unicode character to ANSI parser as UTF-8.
@@ -129,6 +152,15 @@ impl EventSource for WindowsEventSource {
                                             raw_mode,
                                         );
                                     }
+                                } else if vt_input_enabled && record.u_char != 0 && !record.key_down
+                                {
+                                    if let Some(event) = parse::handle_vt_key_release(
+                                        record,
+                                        &mut self.legacy_surrogate,
+                                        raw_mode,
+                                    ) {
+                                        self.parser.push_event(InternalEvent::Event(event));
+                                    }
                                 } else {
                                     // Non-VT fallback: use existing VK code handling.  This is
                                     // also required for VT batches when the record is a key-up
@@ -142,6 +174,9 @@ impl EventSource for WindowsEventSource {
                                 }
                             }
                             InputRecord::MouseEvent(record) => {
+                                // Alt-numpad deduplication is record-adjacent. Any non-key input
+                                // between the packet release and a character invalidates it.
+                                self.alt_numpad_pending = None;
                                 let mouse_event =
                                     handle_mouse_event(record, &self.mouse_buttons_pressed);
                                 self.mouse_buttons_pressed = MouseButtonsPressed {
@@ -154,6 +189,7 @@ impl EventSource for WindowsEventSource {
                                 }
                             }
                             InputRecord::WindowBufferSizeEvent(record) => {
+                                self.alt_numpad_pending = None;
                                 // windows starts counting at 0, unix at 1, add one to replicate unix behaviour.
                                 self.parser.push_event(InternalEvent::Event(Event::Resize(
                                     (record.size.x as i32 + 1) as u16,
@@ -161,6 +197,7 @@ impl EventSource for WindowsEventSource {
                                 )));
                             }
                             InputRecord::FocusEvent(record) => {
+                                self.alt_numpad_pending = None;
                                 let event = if record.set_focus {
                                     Event::FocusGained
                                 } else {
@@ -168,7 +205,9 @@ impl EventSource for WindowsEventSource {
                                 };
                                 self.parser.push_event(InternalEvent::Event(event));
                             }
-                            _ => {}
+                            _ => {
+                                self.alt_numpad_pending = None;
+                            }
                         }
                     }
 
