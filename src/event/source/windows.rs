@@ -5,8 +5,7 @@ use crossterm_winapi::{Console, ConsoleMode, Handle, InputRecord};
 use crate::event::{
     Event, KeyModifiers,
     sys::windows::{
-        parse::MouseButtonsPressed,
-        parse::{handle_key_event, handle_mouse_event},
+        parse::{self, MouseButtonsPressed, handle_key_event, handle_mouse_event},
         poll::WinApiPoll,
     },
 };
