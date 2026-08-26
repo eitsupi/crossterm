@@ -1,8 +1,47 @@
 //! Platform-independent console mode bit manipulation.
 
+use std::io;
+
 const ENABLE_MOUSE_MODE: u32 = 0x0010 | 0x0080 | 0x0008;
 const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
 pub(crate) const NOT_RAW_MODE_MASK: u32 = 0x0001 | 0x0002 | 0x0004;
+
+/// Lifecycle state for bracketed paste's optional console-side VT transport.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BracketedPasteState {
+    Inactive = 0,
+    ConsolePreVtOff = 1,
+    ConsolePreVtOn = 2,
+    NoConsole = 3,
+}
+
+impl BracketedPasteState {
+    pub(crate) fn from_raw(raw: u8) -> Self {
+        match raw {
+            1 => Self::ConsolePreVtOff,
+            2 => Self::ConsolePreVtOn,
+            3 => Self::NoConsole,
+            _ => Self::Inactive,
+        }
+    }
+
+    pub(crate) const fn as_raw(self) -> u8 {
+        self as u8
+    }
+
+    /// Consume a successfully restored state, retaining it when restoration failed.
+    pub(crate) fn after_restore(self, success: bool) -> Self {
+        if success { Self::Inactive } else { self }
+    }
+}
+
+/// Return whether a Win32 console operation failed because no console input
+/// handle exists. Keep this deliberately narrow: access denied and all other
+/// failures must remain visible to callers.
+pub(crate) fn is_console_unavailable_error(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(2 | 6)) // ERROR_FILE_NOT_FOUND / ERROR_INVALID_HANDLE
+}
 
 /// Compute the console mode used by raw mode while preserving every other bit.
 pub(crate) fn compute_enable_raw_mode(current: u32) -> u32 {
@@ -26,16 +65,19 @@ pub(crate) fn compute_disable_mouse_capture_mode(current: u32, original: u32) ->
     (current & !ENABLE_MOUSE_MODE) | (original & ENABLE_MOUSE_MODE)
 }
 
-/// Restore only the VT-input bit from the first-touch mode snapshot.
+/// Restore only the VT-input bit from a saved mode or feature state.
 pub(crate) fn compute_restore_vt_input_mode(current: u32, original: u32) -> u32 {
     (current & !ENABLE_VIRTUAL_TERMINAL_INPUT) | (original & ENABLE_VIRTUAL_TERMINAL_INPUT)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
     use super::{
-        NOT_RAW_MODE_MASK, compute_disable_mouse_capture_mode, compute_disable_raw_mode,
-        compute_enable_raw_mode, compute_restore_vt_input_mode,
+        BracketedPasteState, NOT_RAW_MODE_MASK, compute_disable_mouse_capture_mode,
+        compute_disable_raw_mode, compute_enable_raw_mode, compute_restore_vt_input_mode,
+        is_console_unavailable_error,
     };
 
     const ENABLE_MOUSE_INPUT: u32 = 0x0010;
@@ -65,6 +107,35 @@ mod tests {
             compute_restore_vt_input_mode(current | ENABLE_VIRTUAL_TERMINAL_INPUT, 0),
             current
         );
+    }
+
+    #[test]
+    fn test_console_unavailable_error_classification_is_narrow() {
+        assert!(is_console_unavailable_error(&io::Error::from_raw_os_error(
+            2
+        )));
+        assert!(is_console_unavailable_error(&io::Error::from_raw_os_error(
+            6
+        )));
+        assert!(!is_console_unavailable_error(
+            &io::Error::from_raw_os_error(5)
+        ));
+        assert!(!is_console_unavailable_error(&io::Error::other(
+            "not a Win32 error"
+        )));
+    }
+
+    #[test]
+    fn test_bracketed_paste_state_consumes_only_after_success() {
+        for state in [
+            BracketedPasteState::ConsolePreVtOff,
+            BracketedPasteState::ConsolePreVtOn,
+            BracketedPasteState::NoConsole,
+        ] {
+            assert_eq!(state.after_restore(false), state);
+            assert_eq!(state.after_restore(true), BracketedPasteState::Inactive);
+            assert_eq!(BracketedPasteState::from_raw(state.as_raw()), state);
+        }
     }
 
     #[test]

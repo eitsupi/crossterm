@@ -437,6 +437,9 @@ impl Command for DisableFocusChange {
 /// preserve key-release information while VT input is active. These paired
 /// commands are queue boundaries on Windows and are not reference-counted;
 /// callers must pair each enable with a disable without relying on nesting.
+/// In ANSI-capable environments without a `CONIN$` console (for example,
+/// Git Bash or mintty), the ANSI command still runs and the Win32 mode side
+/// effect is skipped safely.
 #[cfg(feature = "bracketed-paste")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnableBracketedPaste;
@@ -471,6 +474,9 @@ impl Command for EnableBracketedPaste {
 /// On Windows, the ANSI disable sequence is flushed before VT input is
 /// restored. The command is paired with [`EnableBracketedPaste`] and is not
 /// reference-counted.
+///
+/// If the paired enable found no `CONIN$` console, this command only disables
+/// the ANSI protocol and safely performs no Win32 mode restore.
 #[cfg(feature = "bracketed-paste")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DisableBracketedPaste;
