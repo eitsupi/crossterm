@@ -19,38 +19,30 @@
 //! including `KeyEventKind` and bracketed-paste events. Press Escape to finish.
 //!
 //! Expected observations on conhost include `a` and F1 producing both Press and Release
-//! events (and Repeat while held) in phase 1, Alt+numpad 0233 producing one character
+//! events (held keys may be exposed as additional Press records) in phase 1,
+//! Alt+numpad 0233 producing one character
 //! Press in phase 2, and a multiline paste producing one `Paste` event rather than one
 //! event per line. Windows Terminal/ConPTY can be Press-only during phase 2 because
 //! VT input does not preserve all key-release records.
 
-#[cfg(windows)]
-mod windows {
-    use std::collections::HashMap;
-    use std::io;
-    use std::time::Duration;
+#[cfg(all(any(windows, test), feature = "events"))]
+#[cfg_attr(not(windows), allow(dead_code))]
+mod stats {
+    use std::collections::{HashMap, HashSet};
 
-    use crossterm::event::{
-        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind, poll, read,
-    };
-    use crossterm::execute;
-    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-    use crossterm_winapi::{ConsoleMode, Handle};
-
-    const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
-    const ENABLE_MOUSE_INPUT: u32 = 0x0010;
-    const ENABLE_WINDOW_INPUT: u32 = 0x0008;
-    const ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
+    use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 
     #[derive(Default)]
-    struct SessionStats {
+    pub(super) struct SessionStats {
         mouse_moved: u64,
         mouse_clicks: u64,
         mouse_drags: u64,
         mouse_wheels: u64,
         key_presses: u64,
         key_releases: u64,
+        repeated_presses_while_held: u64,
+        repeat_events: u64,
+        held_keys: HashSet<(KeyCode, KeyModifiers)>,
         press_balance: HashMap<(KeyCode, KeyModifiers), i32>,
         duplicate_candidates: u64,
         last_alt_press: Option<(KeyCode, KeyModifiers)>,
@@ -58,12 +50,23 @@ mod windows {
     }
 
     impl SessionStats {
-        fn clear_duplicate_state(&mut self) {
+        pub(super) fn clear_duplicate_state(&mut self) {
             self.last_alt_press = None;
             self.duplicate_candidate = None;
         }
 
-        fn record(&mut self, event: &Event) {
+        pub(super) fn cancel_control_press(&mut self, event: &Event) {
+            if let Event::Key(key) = event
+                && key.kind == KeyEventKind::Press
+            {
+                let identity = (key.code, key.modifiers);
+                if self.held_keys.remove(&identity) {
+                    *self.press_balance.entry(identity).or_default() -= 1;
+                }
+            }
+        }
+
+        pub(super) fn record(&mut self, event: &Event) {
             match event {
                 Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved) => {
                     self.mouse_moved += 1;
@@ -95,11 +98,18 @@ mod windows {
                         } else {
                             self.last_alt_press = None;
                         }
-                        *self.press_balance.entry(identity).or_default() += 1;
+                        if !self.held_keys.insert(identity) {
+                            self.repeated_presses_while_held += 1;
+                        } else {
+                            *self.press_balance.entry(identity).or_default() += 1;
+                        }
                     }
                     KeyEventKind::Release => {
                         self.key_releases += 1;
                         let identity = (key.code, key.modifiers);
+                        // Removing a held identity balances its first Press. For a release-first
+                        // or extra Release, decrementing a new entry keeps the negative mismatch.
+                        self.held_keys.remove(&identity);
                         *self.press_balance.entry(identity).or_default() -= 1;
                         self.duplicate_candidate = self
                             .last_alt_press
@@ -110,6 +120,7 @@ mod windows {
                         self.last_alt_press = None;
                     }
                     KeyEventKind::Repeat => {
+                        self.repeat_events += 1;
                         self.clear_duplicate_state();
                     }
                 },
@@ -119,29 +130,127 @@ mod windows {
             }
         }
 
-        fn print_summary(&self) {
+        fn event_imbalance(&self) -> i32 {
+            self.press_balance.values().map(|count| count.abs()).sum()
+        }
+
+        pub(super) fn print_summary(&self) {
             let mismatches = self
                 .press_balance
                 .values()
                 .filter(|count| **count != 0)
                 .count();
-            let imbalance: i32 = self.press_balance.values().map(|count| count.abs()).sum();
             println!("\nSummary:");
             println!(
                 "  key Press={}, Release={}",
                 self.key_presses, self.key_releases
             );
             println!(
+                "  additional Press while held={}, Repeat-kind events={}",
+                self.repeated_presses_while_held, self.repeat_events
+            );
+            println!(
                 "  mouse Moved={} (suppressed from log), click={}, drag={}, wheel={}",
                 self.mouse_moved, self.mouse_clicks, self.mouse_drags, self.mouse_wheels
             );
-            println!("  Press/Release mismatches={mismatches}, event imbalance={imbalance}");
+            println!(
+                "  Press/Release mismatches={mismatches}, event imbalance={}",
+                self.event_imbalance()
+            );
             println!(
                 "  ALT Press -> matching Release -> same-code NONE Press duplicates={}",
                 self.duplicate_candidates
             );
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn key(code: KeyCode, modifiers: KeyModifiers, kind: KeyEventKind) -> Event {
+            Event::Key(crossterm::event::KeyEvent::new_with_kind(
+                code, modifiers, kind,
+            ))
+        }
+
+        #[test]
+        fn held_additional_press_does_not_imbalance() {
+            let mut stats = SessionStats::default();
+            let event = key(KeyCode::Char('a'), KeyModifiers::NONE, KeyEventKind::Press);
+            stats.record(&event);
+            stats.record(&event);
+            stats.record(&key(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            ));
+            assert_eq!(stats.repeated_presses_while_held, 1);
+            assert_eq!(stats.event_imbalance(), 0);
+        }
+
+        #[test]
+        fn release_first_reports_negative_imbalance() {
+            let mut stats = SessionStats::default();
+            stats.record(&key(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            ));
+            assert_eq!(stats.event_imbalance(), 1);
+            assert_eq!(
+                stats.press_balance[&(KeyCode::Char('a'), KeyModifiers::NONE)],
+                -1
+            );
+        }
+
+        #[test]
+        fn modifier_mismatch_keeps_two_unbalanced_identities() {
+            let mut stats = SessionStats::default();
+            stats.record(&key(
+                KeyCode::Char('B'),
+                KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+                KeyEventKind::Press,
+            ));
+            stats.record(&key(
+                KeyCode::Char('b'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            ));
+            assert_eq!(stats.press_balance.len(), 2);
+            assert_eq!(stats.event_imbalance(), 2);
+        }
+
+        #[test]
+        fn cancel_control_press_balances_transition_event() {
+            let mut stats = SessionStats::default();
+            let event = key(KeyCode::Char('p'), KeyModifiers::NONE, KeyEventKind::Press);
+            stats.record(&event);
+            stats.cancel_control_press(&event);
+            assert_eq!(stats.event_imbalance(), 0);
+            assert!(stats.held_keys.is_empty());
+        }
+    }
+}
+
+#[cfg(windows)]
+mod windows {
+    use std::io;
+    use std::time::Duration;
+
+    use super::stats::SessionStats;
+    use crossterm::event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEventKind, MouseEventKind, poll, read,
+    };
+    use crossterm::execute;
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+    use crossterm_winapi::{ConsoleMode, Handle};
+
+    const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
+    const ENABLE_MOUSE_INPUT: u32 = 0x0010;
+    const ENABLE_WINDOW_INPUT: u32 = 0x0008;
+    const ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
 
     fn current_console_mode() -> io::Result<u32> {
         let handle = Handle::current_in_handle()?;
@@ -163,6 +272,22 @@ mod windows {
     fn is_transition_p_release(event: &Event) -> bool {
         is_transition_p(event)
             && matches!(event, Event::Key(key) if key.kind == KeyEventKind::Release)
+    }
+
+    fn drain_startup_events(initially_available: bool) -> io::Result<()> {
+        let mut available = initially_available;
+        while available {
+            let event = read()?;
+            if !matches!(&event, Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved))
+            {
+                println!("Startup event: {event:?}");
+            }
+            // Poll only with a zero timeout: drain the records already queued after the
+            // initial poll, then begin the interactive phase without waiting for new input.
+            // A new record racing with the final zero-time poll belongs to the session.
+            available = poll(Duration::ZERO)?;
+        }
+        Ok(())
     }
 
     fn read_phase(
@@ -202,7 +327,15 @@ mod windows {
                 stats.clear_duplicate_state();
                 return Ok((false, false));
             }
+            let transition_press = transition_on_press
+                && phase_transition_key
+                && matches!(&event, Event::Key(key) if key.kind == KeyEventKind::Press);
             stats.record(&event);
+            if transition_press {
+                // This control Press may have no observable Release on a VT transport; keep it
+                // in raw counts but exclude it from the balance diagnostic.
+                stats.cancel_control_press(&event);
+            }
             if phase_transition_pending {
                 if phase_transition_release {
                     return Ok((true, false));
@@ -218,7 +351,7 @@ mod windows {
         }
     }
 
-    fn run_session() -> io::Result<()> {
+    fn run_session(initial_poll_result: bool) -> io::Result<()> {
         let mut stdout = io::stdout();
         let mut raw_enabled = false;
         let mut mouse_cleanup_required = false;
@@ -227,6 +360,7 @@ mod windows {
         let mut phase_two_stats = SessionStats::default();
 
         let session_result = (|| {
+            drain_startup_events(initial_poll_result)?;
             let mode_before_raw = current_console_mode()?;
             enable_raw_mode()?;
             raw_enabled = true;
@@ -350,7 +484,7 @@ mod windows {
         );
         println!("initial poll result: {poll_result}");
 
-        let session_result = run_session();
+        let session_result = run_session(poll_result);
 
         let final_mode_result = current_console_mode();
         match final_mode_result {
