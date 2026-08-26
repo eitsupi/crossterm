@@ -12,13 +12,16 @@
 //! cargo run --example windows-vt-input --all-features
 //! ```
 //!
-//! While it is running, press ordinary keys, F1, an Alt+numpad character, and paste
-//! multiline text. Every event is printed with `Debug`, including `KeyEventKind` and
-//! bracketed-paste events. Press Escape to finish.
+//! While it is running, phase 1 checks ordinary Win32 input (press and release
+//! `P` to begin phase 2), then phase 2 checks bracketed paste, SGR mouse, and a physical
+//! numeric-keypad Alt+numpad character. Every event is printed with `Debug`,
+//! including `KeyEventKind` and bracketed-paste events. Press Escape to finish.
 //!
 //! Expected observations on conhost include `a` and F1 producing both Press and Release
-//! events (and Repeat while held), Alt+numpad 0233 producing a character event, and a
-//! multiline paste producing one `Paste` event rather than one event per line.
+//! events (and Repeat while held) in phase 1, Alt+numpad 0233 producing one character
+//! Press in phase 2, and a multiline paste producing one `Paste` event rather than one
+//! event per line. Windows Terminal/ConPTY can be Press-only during phase 2 because
+//! VT input does not preserve all key-release records.
 
 #[cfg(windows)]
 mod windows {
@@ -37,6 +40,7 @@ mod windows {
     const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
     const ENABLE_MOUSE_INPUT: u32 = 0x0010;
     const ENABLE_WINDOW_INPUT: u32 = 0x0008;
+    const ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
 
     #[derive(Default)]
     struct SessionStats {
@@ -46,41 +50,47 @@ mod windows {
         mouse_wheels: u64,
         key_presses: u64,
         key_releases: u64,
-        press_balance: HashMap<(KeyCode, KeyModifiers), u32>,
+        press_balance: HashMap<(KeyCode, KeyModifiers), i32>,
         duplicate_candidates: u64,
-        last_alt_press: Option<KeyCode>,
-        duplicate_candidate_key: Option<KeyCode>,
+        last_alt_press: Option<(KeyCode, KeyModifiers)>,
+        duplicate_candidate: Option<(KeyCode, KeyModifiers)>,
     }
 
     impl SessionStats {
+        fn clear_duplicate_state(&mut self) {
+            self.last_alt_press = None;
+            self.duplicate_candidate = None;
+        }
+
         fn record(&mut self, event: &Event) {
             match event {
                 Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved) => {
                     self.mouse_moved += 1;
+                    self.clear_duplicate_state();
                 }
-                Event::Mouse(mouse) => match mouse.kind {
-                    MouseEventKind::Down(_) | MouseEventKind::Up(_) => self.mouse_clicks += 1,
-                    MouseEventKind::Drag(_) => self.mouse_drags += 1,
-                    MouseEventKind::ScrollUp
-                    | MouseEventKind::ScrollDown
-                    | MouseEventKind::ScrollLeft
-                    | MouseEventKind::ScrollRight => self.mouse_wheels += 1,
-                    MouseEventKind::Moved => unreachable!(),
-                },
-                Event::Key(key) if key.code == KeyCode::Esc => {
-                    // Escape terminates the diagnostic; do not report its intentional lone Press
-                    // as an unmatched key in the final summary.
+                Event::Mouse(mouse) => {
+                    self.clear_duplicate_state();
+                    match mouse.kind {
+                        MouseEventKind::Down(_) | MouseEventKind::Up(_) => self.mouse_clicks += 1,
+                        MouseEventKind::Drag(_) => self.mouse_drags += 1,
+                        MouseEventKind::ScrollUp
+                        | MouseEventKind::ScrollDown
+                        | MouseEventKind::ScrollLeft
+                        | MouseEventKind::ScrollRight => self.mouse_wheels += 1,
+                        MouseEventKind::Moved => unreachable!(),
+                    }
                 }
+                Event::Key(key) if key.code == KeyCode::Esc => self.clear_duplicate_state(),
                 Event::Key(key) => match key.kind {
                     KeyEventKind::Press => {
                         self.key_presses += 1;
                         let identity = (key.code, key.modifiers);
-                        if self.duplicate_candidate_key == Some(key.code) {
+                        if self.duplicate_candidate == Some(identity) {
                             self.duplicate_candidates += 1;
-                            self.duplicate_candidate_key = None;
                         }
+                        self.duplicate_candidate = None;
                         if key.modifiers.contains(KeyModifiers::ALT) {
-                            self.last_alt_press = Some(key.code);
+                            self.last_alt_press = Some(identity);
                         } else {
                             self.last_alt_press = None;
                         }
@@ -89,17 +99,22 @@ mod windows {
                     KeyEventKind::Release => {
                         self.key_releases += 1;
                         let identity = (key.code, key.modifiers);
-                        if let Some(balance) = self.press_balance.get_mut(&identity) {
-                            *balance = balance.saturating_sub(1);
-                        }
-                        self.duplicate_candidate_key = self
+                        *self.press_balance.entry(identity).or_default() -= 1;
+                        self.duplicate_candidate = self
                             .last_alt_press
-                            .filter(|press_code| *press_code == key.code);
+                            .filter(|(press_code, press_modifiers)| {
+                                *press_code == key.code && *press_modifiers == key.modifiers
+                            })
+                            .map(|(code, _)| (code, KeyModifiers::NONE));
                         self.last_alt_press = None;
                     }
-                    KeyEventKind::Repeat => {}
+                    KeyEventKind::Repeat => {
+                        self.clear_duplicate_state();
+                    }
                 },
-                _ => {}
+                _ => {
+                    self.clear_duplicate_state();
+                }
             }
         }
 
@@ -109,6 +124,7 @@ mod windows {
                 .values()
                 .filter(|count| **count != 0)
                 .count();
+            let imbalance: i32 = self.press_balance.values().map(|count| count.abs()).sum();
             println!("\nSummary:");
             println!(
                 "  key Press={}, Release={}",
@@ -118,9 +134,9 @@ mod windows {
                 "  mouse Moved={} (suppressed from log), click={}, drag={}, wheel={}",
                 self.mouse_moved, self.mouse_clicks, self.mouse_drags, self.mouse_wheels
             );
-            println!("  Press/Release mismatches={mismatches}");
+            println!("  Press/Release mismatches={mismatches}, event imbalance={imbalance}");
             println!(
-                "  ALT Press -> Release -> same-code NONE Press candidates={} (manual check)",
+                "  ALT Press -> matching Release -> same-code NONE Press duplicates={}",
                 self.duplicate_candidates
             );
         }
@@ -136,24 +152,78 @@ mod windows {
         println!("{label}: mode=0x{mode:08x}, VT_INPUT={vt_input}");
     }
 
+    fn read_phase(stats: &mut SessionStats, phase: &str) -> io::Result<bool> {
+        println!("{phase}");
+        let mut phase_transition_pending = false;
+        loop {
+            let event = read()?;
+            let phase_transition_key = phase.starts_with("Phase 1")
+                && matches!(
+                    &event,
+                    Event::Key(key)
+                        if matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'))
+                );
+            let phase_transition_release = phase_transition_key
+                && matches!(&event, Event::Key(key) if key.kind == KeyEventKind::Release);
+            let exit = matches!(
+                &event,
+                Event::Key(key) if key.code == KeyCode::Esc && key.kind == KeyEventKind::Press
+            );
+            if exit {
+                stats.clear_duplicate_state();
+                return Ok(false);
+            }
+            stats.record(&event);
+            if phase_transition_pending {
+                if phase_transition_release {
+                    return Ok(true);
+                }
+            } else if phase_transition_key
+                && matches!(&event, Event::Key(key) if key.kind == KeyEventKind::Press)
+            {
+                phase_transition_pending = true;
+            }
+            if !matches!(&event, Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved))
+            {
+                println!("Event: {event:?}");
+            }
+        }
+    }
+
     fn run_session() -> io::Result<()> {
         let mut stdout = io::stdout();
         let mut raw_enabled = false;
-        let mut mouse_enabled = false;
-        let mut paste_enabled = false;
-        let mut stats = SessionStats::default();
+        let mut mouse_cleanup_required = false;
+        let mut paste_cleanup_required = false;
+        let mut phase_one_stats = SessionStats::default();
+        let mut phase_two_stats = SessionStats::default();
 
         let session_result = (|| {
+            let mode_before_raw = current_console_mode()?;
             enable_raw_mode()?;
             raw_enabled = true;
 
             let raw_mode = current_console_mode()?;
             print_mode("after enable_raw_mode", raw_mode);
-            if raw_mode & ENABLE_VIRTUAL_TERMINAL_INPUT != 0 {
-                println!("raw-mode VT_INPUT activation: PASS");
+            let vt_preserved = (mode_before_raw & ENABLE_VIRTUAL_TERMINAL_INPUT)
+                == (raw_mode & ENABLE_VIRTUAL_TERMINAL_INPUT);
+            println!(
+                "raw-mode VT_INPUT preservation: {}",
+                if vt_preserved { "PASS" } else { "FAIL" }
+            );
+            if !vt_preserved {
+                return Err(io::Error::other(
+                    "raw mode changed ENABLE_VIRTUAL_TERMINAL_INPUT",
+                ));
+            }
+            let phase_one_label = if mode_before_raw & ENABLE_VIRTUAL_TERMINAL_INPUT == 0 {
+                "Phase 1: ordinary Win32 input (paste disabled)"
             } else {
+                "Phase 1: original input transport (paste disabled)"
+            };
+            if mode_before_raw & ENABLE_VIRTUAL_TERMINAL_INPUT != 0 {
                 println!(
-                    "raw-mode VT_INPUT activation: legacy/unsupported fallback (not a failure)"
+                    "Phase 1 preserves pre-existing VT input; Win32 Release semantics cannot be isolated in this session"
                 );
             }
             println!(
@@ -161,31 +231,37 @@ mod windows {
                 raw_mode & ENABLE_MOUSE_INPUT != 0,
                 raw_mode & ENABLE_WINDOW_INPUT != 0
             );
+            mouse_cleanup_required = true;
             execute!(stdout, EnableMouseCapture)?;
-            mouse_enabled = true;
             let mouse_mode = current_console_mode()?;
             print_mode("after EnableMouseCapture", mouse_mode);
-            execute!(stdout, EnableBracketedPaste)?;
-            paste_enabled = true;
-            println!(
-                "Reading events. Try click, drag, wheel, paste, ordinary keys, Ctrl+Shift+letter, and Alt+numpad 0233. Moved events are counted but not logged. Press Esc to exit."
-            );
-
-            loop {
-                let event = read()?;
-                stats.record(&event);
-                if !matches!(&event, Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved))
-                {
-                    println!("Event: {event:?}");
-                }
-
-                if let Event::Key(key) = event
-                    && key.code == KeyCode::Esc
-                    && key.kind == KeyEventKind::Press
-                {
-                    break;
-                }
+            if mode_before_raw & ENABLE_VIRTUAL_TERMINAL_INPUT == 0 {
+                println!(
+                    "Phase 1 (paste disabled): press ordinary keys, F1, Ctrl+Shift+B, and use Win32 mouse. Press and release P to continue, or press Esc to exit."
+                );
+            } else {
+                println!(
+                    "Phase 1 (paste disabled): exercise the original input transport with ordinary keys, F1, Ctrl+Shift+B, and mouse. Press and release P to continue, or press Esc to exit."
+                );
             }
+            let continue_to_paste = read_phase(&mut phase_one_stats, phase_one_label)?;
+            phase_one_stats.print_summary();
+            if !continue_to_paste {
+                return Ok(());
+            }
+
+            paste_cleanup_required = true;
+            execute!(stdout, EnableBracketedPaste)?;
+            let paste_mode = current_console_mode()?;
+            print_mode("after EnableBracketedPaste", paste_mode);
+            println!(
+                "Phase 2 (paste enabled): paste multiline text, use SGR mouse, and type physical numeric-keypad Alt+0233. Windows Terminal/ConPTY may report key Press without Release while VT input is active. Press Esc to exit."
+            );
+            let _ = read_phase(
+                &mut phase_two_stats,
+                "Phase 2: VT transport (bracketed paste enabled)",
+            )?;
+            phase_two_stats.print_summary();
 
             Ok(())
         })();
@@ -193,12 +269,12 @@ mod windows {
         // Cleanup is deliberately unconditional: a command or read can fail after raw mode or
         // bracketed paste has already been enabled.
         let mut cleanup_error = None;
-        if mouse_enabled {
+        if mouse_cleanup_required {
             if let Err(error) = execute!(stdout, DisableMouseCapture) {
                 cleanup_error = Some(error);
             }
         }
-        if paste_enabled {
+        if paste_cleanup_required {
             if let Err(error) = execute!(stdout, DisableBracketedPaste) {
                 cleanup_error.get_or_insert(error);
             }
@@ -211,8 +287,6 @@ mod windows {
         if let Err(error) = disable_raw_result {
             cleanup_error.get_or_insert(error);
         }
-        stats.print_summary();
-
         if let Err(error) = session_result {
             return Err(error);
         }
@@ -247,22 +321,24 @@ mod windows {
         match final_mode_result {
             Ok(final_mode) => {
                 print_mode("after cleanup", final_mode);
-                let restore_mask =
-                    ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_MOUSE_INPUT | ENABLE_WINDOW_INPUT;
+                let restore_mask = ENABLE_VIRTUAL_TERMINAL_INPUT
+                    | ENABLE_MOUSE_INPUT
+                    | ENABLE_WINDOW_INPUT
+                    | ENABLE_EXTENDED_FLAGS;
                 let restored = final_mode & restore_mask == original_mode & restore_mask;
                 println!(
-                    "original VT_INPUT/MOUSE_INPUT/WINDOW_INPUT restoration: {}",
+                    "original VT_INPUT/MOUSE_INPUT/WINDOW_INPUT/EXTENDED_FLAGS restoration: {}",
                     if restored { "PASS" } else { "FAIL" }
                 );
                 if !restored && session_result.is_ok() {
                     return Err(io::Error::other(
-                        "VT_INPUT bit was not restored after diagnostic cleanup",
+                        "console input mode bits were not restored after diagnostic cleanup",
                     ));
                 }
             }
             Err(error) => {
                 println!("after cleanup: unable to read console mode: {error}");
-                println!("original VT_INPUT bit restoration: FAIL");
+                println!("original console input mode restoration: FAIL");
                 if session_result.is_ok() {
                     return Err(error);
                 }
