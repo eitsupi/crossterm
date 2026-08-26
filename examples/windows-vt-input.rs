@@ -153,6 +153,18 @@ mod windows {
         println!("{label}: mode=0x{mode:08x}, VT_INPUT={vt_input}");
     }
 
+    fn is_transition_p(event: &Event) -> bool {
+        matches!(
+            event,
+            Event::Key(key) if matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'))
+        )
+    }
+
+    fn is_transition_p_release(event: &Event) -> bool {
+        is_transition_p(event)
+            && matches!(event, Event::Key(key) if key.kind == KeyEventKind::Release)
+    }
+
     fn read_phase(
         stats: &mut SessionStats,
         phase: &str,
@@ -170,23 +182,18 @@ mod windows {
             {
                 println!("Event: {event:?}");
             }
-            let phase_transition_key = phase.starts_with("Phase 1")
-                && matches!(
-                    &event,
-                    Event::Key(key)
-                        if matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'))
-                );
-            let phase_transition_release = phase_transition_key
-                && matches!(&event, Event::Key(key) if key.kind == KeyEventKind::Release);
+            // The phase gate applies only to transitioning out of Phase 1. The
+            // Phase 2 buffered-release cleanup must use the key identity alone.
+            let transition_p = is_transition_p(&event);
+            let phase_transition_key = phase.starts_with("Phase 1") && transition_p;
+            let phase_transition_release = phase_transition_key && is_transition_p_release(&event);
             let exit = matches!(
                 &event,
                 Event::Key(key) if key.code == KeyCode::Esc && key.kind == KeyEventKind::Press
             );
             if ignore_next_transition_release {
                 ignore_next_transition_release = false;
-                if phase_transition_key
-                    && matches!(&event, Event::Key(key) if key.kind == KeyEventKind::Release)
-                {
+                if is_transition_p_release(&event) {
                     println!("Ignoring the buffered Phase 1 transition P release in Phase 2");
                     continue;
                 }
