@@ -12,8 +12,9 @@
 //! cargo run --example windows-vt-input --all-features
 //! ```
 //!
-//! While it is running, phase 1 checks ordinary Win32 input (press and release
-//! `P` to begin phase 2), then phase 2 checks bracketed paste, SGR mouse, and a physical
+//! While it is running, phase 1 checks the original input transport (press and
+//! release `P` to begin phase 2 when VT was initially off; with pre-existing VT
+//! input, pressing `P` is sufficient), then phase 2 checks bracketed paste, SGR mouse, and a physical
 //! numeric-keypad Alt+numpad character. Every event is printed with `Debug`,
 //! including `KeyEventKind` and bracketed-paste events. Press Escape to finish.
 //!
@@ -152,11 +153,23 @@ mod windows {
         println!("{label}: mode=0x{mode:08x}, VT_INPUT={vt_input}");
     }
 
-    fn read_phase(stats: &mut SessionStats, phase: &str) -> io::Result<bool> {
+    fn read_phase(
+        stats: &mut SessionStats,
+        phase: &str,
+        transition_on_press: bool,
+        mut ignore_next_transition_release: bool,
+    ) -> io::Result<(bool, bool)> {
+        // A pre-existing VT transport may not emit the P release. In that case
+        // transition on the press and ignore at most the immediately following
+        // buffered release in phase 2.
         println!("{phase}");
         let mut phase_transition_pending = false;
         loop {
             let event = read()?;
+            if !matches!(&event, Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved))
+            {
+                println!("Event: {event:?}");
+            }
             let phase_transition_key = phase.starts_with("Phase 1")
                 && matches!(
                     &event,
@@ -169,23 +182,31 @@ mod windows {
                 &event,
                 Event::Key(key) if key.code == KeyCode::Esc && key.kind == KeyEventKind::Press
             );
+            if ignore_next_transition_release {
+                ignore_next_transition_release = false;
+                if phase_transition_key
+                    && matches!(&event, Event::Key(key) if key.kind == KeyEventKind::Release)
+                {
+                    println!("Ignoring the buffered Phase 1 transition P release in Phase 2");
+                    continue;
+                }
+            }
             if exit {
                 stats.clear_duplicate_state();
-                return Ok(false);
+                return Ok((false, false));
             }
             stats.record(&event);
             if phase_transition_pending {
                 if phase_transition_release {
-                    return Ok(true);
+                    return Ok((true, false));
                 }
             } else if phase_transition_key
                 && matches!(&event, Event::Key(key) if key.kind == KeyEventKind::Press)
             {
+                if transition_on_press {
+                    return Ok((true, true));
+                }
                 phase_transition_pending = true;
-            }
-            if !matches!(&event, Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved))
-            {
-                println!("Event: {event:?}");
             }
         }
     }
@@ -244,7 +265,12 @@ mod windows {
                     "Phase 1 (paste disabled): exercise the original input transport with ordinary keys, F1, Ctrl+Shift+B, and mouse. Press and release P to continue, or press Esc to exit."
                 );
             }
-            let continue_to_paste = read_phase(&mut phase_one_stats, phase_one_label)?;
+            let (continue_to_paste, ignore_transition_release) = read_phase(
+                &mut phase_one_stats,
+                phase_one_label,
+                mode_before_raw & ENABLE_VIRTUAL_TERMINAL_INPUT != 0,
+                false,
+            )?;
             phase_one_stats.print_summary();
             if !continue_to_paste {
                 return Ok(());
@@ -260,6 +286,8 @@ mod windows {
             let _ = read_phase(
                 &mut phase_two_stats,
                 "Phase 2: VT transport (bracketed paste enabled)",
+                false,
+                ignore_transition_release,
             )?;
             phase_two_stats.print_summary();
 
