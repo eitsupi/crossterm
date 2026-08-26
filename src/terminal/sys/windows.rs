@@ -4,21 +4,15 @@ use std::fmt::{self, Write};
 use std::io::{self};
 
 use crossterm_winapi::{Console, ConsoleMode, Coord, Handle, ScreenBuffer, Size};
-use winapi::{
-    shared::minwindef::DWORD,
-    um::wincon::{ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, SetConsoleTitleW},
-};
+use winapi::{shared::minwindef::DWORD, um::wincon::SetConsoleTitleW};
 
 use crate::{
     cursor,
     terminal::{ClearType, WindowSize},
 };
 
-/// bits which can't be set in raw mode
-const NOT_RAW_MODE_MASK: DWORD = ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT;
-
-// https://learn.microsoft.com/en-us/windows/console/setconsolemode
-const ENABLE_VIRTUAL_TERMINAL_INPUT: DWORD = 0x0200;
+/// Bits which can't be set in raw mode.
+const NOT_RAW_MODE_MASK: DWORD = crate::terminal::sys::windows_mode::NOT_RAW_MODE_MASK;
 
 pub(crate) fn is_raw_mode_enabled() -> std::io::Result<bool> {
     let console_mode = ConsoleMode::from(Handle::current_in_handle()?);
@@ -35,62 +29,20 @@ pub(crate) fn is_raw_mode_from_console_mode(dw_mode: DWORD) -> bool {
     dw_mode & NOT_RAW_MODE_MASK == 0
 }
 
-/// Compute the console mode to apply when entering raw mode.
-/// Extracted for unit-testability: the Win32 call site can't be mocked, but
-/// the bit-manipulation logic can be verified on any platform.
-///
-/// `current` — the mode read from the console handle immediately before the call.
-/// `original` — the mode that was in effect before crossterm first touched it,
-///              or `None` if it hasn't been saved yet (VT adjustment is skipped).
-#[cfg_attr(not(feature = "events"), allow(dead_code))]
-fn compute_enable_raw_mode(current: DWORD, original: Option<DWORD>) -> DWORD {
-    let mut mode = current & !NOT_RAW_MODE_MASK;
-    // If this process originally enabled VT input (i.e., it was absent before we
-    // touched the console), re-apply it.  disable_raw_mode() clears it to restore
-    // the original state; we need it back every time we re-enter raw mode.
-    if let Some(orig) = original {
-        if orig & ENABLE_VIRTUAL_TERMINAL_INPUT == 0 {
-            mode |= ENABLE_VIRTUAL_TERMINAL_INPUT;
-        }
-    }
-    mode
-}
-
-/// Compute the console mode to apply when leaving raw mode.
-/// See `compute_enable_raw_mode` for parameter semantics.
-fn compute_disable_raw_mode(current: DWORD, original: Option<DWORD>) -> DWORD {
-    let mut mode = current | NOT_RAW_MODE_MASK;
-    // Clear VT input only if this process was the one that enabled it.
-    if let Some(orig) = original {
-        if orig & ENABLE_VIRTUAL_TERMINAL_INPUT == 0 {
-            mode &= !ENABLE_VIRTUAL_TERMINAL_INPUT;
-        }
-    }
-    mode
-}
-
 pub(crate) fn enable_raw_mode() -> std::io::Result<()> {
     let console_mode = ConsoleMode::from(Handle::current_in_handle()?);
     let dw_mode = console_mode.mode()?;
 
     #[cfg(feature = "events")]
-    let original = {
+    {
         // Capture the mode immediately before crossterm starts changing it.  Event-source
         // construction must remain side-effect free, so raw-mode entry is the first place
         // where this snapshot is normally initialized.
         crate::event::sys::windows::init_original_console_mode(dw_mode);
-        crate::event::sys::windows::original_console_mode().ok()
-    };
-    #[cfg(not(feature = "events"))]
-    let original: Option<DWORD> = None;
-
-    let new_mode = compute_enable_raw_mode(dw_mode, original);
-    // ENABLE_VIRTUAL_TERMINAL_INPUT may be unsupported on legacy consoles.
-    // If the combined set_mode call fails, retry without the VT bit so raw
-    // mode is always entered; VT input is treated as best-effort.
-    if console_mode.set_mode(new_mode).is_err() {
-        console_mode.set_mode(new_mode & !ENABLE_VIRTUAL_TERMINAL_INPUT)?;
     }
+
+    let new_mode = crate::terminal::sys::windows_mode::compute_enable_raw_mode(dw_mode);
+    console_mode.set_mode(new_mode)?;
     Ok(())
 }
 
@@ -98,12 +50,7 @@ pub(crate) fn disable_raw_mode() -> std::io::Result<()> {
     let console_mode = ConsoleMode::from(Handle::current_in_handle()?);
     let dw_mode = console_mode.mode()?;
 
-    #[cfg(feature = "events")]
-    let original = crate::event::sys::windows::original_console_mode().ok();
-    #[cfg(not(feature = "events"))]
-    let original: Option<DWORD> = None;
-
-    let new_mode = compute_disable_raw_mode(dw_mode, original);
+    let new_mode = crate::terminal::sys::windows_mode::compute_disable_raw_mode(dw_mode);
     console_mode.set_mode(new_mode)?;
 
     Ok(())
@@ -426,10 +373,12 @@ mod tests {
     use winapi::um::wincon::GetConsoleTitleW;
 
     use super::{
-        ENABLE_VIRTUAL_TERMINAL_INPUT, NOT_RAW_MODE_MASK, compute_disable_raw_mode,
-        compute_enable_raw_mode, scroll_down, scroll_up, set_size, set_window_title, size,
+        NOT_RAW_MODE_MASK, scroll_down, scroll_up, set_size, set_window_title, size,
         temp_screen_buffer,
     };
+    use crate::terminal::sys::windows_mode::{compute_disable_raw_mode, compute_enable_raw_mode};
+
+    const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
 
     #[test]
     #[serial]
@@ -537,7 +486,7 @@ mod tests {
     #[test]
     fn test_compute_enable_raw_mode_clears_not_raw_bits() {
         let current = BASE_MODE | NOT_RAW_MODE_MASK;
-        let result = compute_enable_raw_mode(current, None);
+        let result = compute_enable_raw_mode(current);
         assert_eq!(
             result & NOT_RAW_MODE_MASK,
             0,
@@ -546,25 +495,17 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_enable_raw_mode_sets_vt_when_original_lacked_it() {
-        // Original mode had no VT input — crossterm added it, so re-enable on entry.
+    fn test_compute_enable_raw_mode_preserves_vt_when_current_lacks_it() {
         let current = BASE_MODE;
-        let original = Some(BASE_MODE); // no ENABLE_VIRTUAL_TERMINAL_INPUT bit
-        let result = compute_enable_raw_mode(current, original);
-        assert_ne!(
-            result & ENABLE_VIRTUAL_TERMINAL_INPUT,
-            0,
-            "VT input must be re-enabled"
-        );
+        let result = compute_enable_raw_mode(current);
+        assert_eq!(result & ENABLE_VIRTUAL_TERMINAL_INPUT, 0);
     }
 
     #[test]
-    fn test_compute_enable_raw_mode_preserves_vt_when_original_had_it() {
-        // VT input was already present before crossterm — don't touch it.
+    fn test_compute_enable_raw_mode_preserves_vt_when_current_has_it() {
+        // VT input was already present before this operation — don't touch it.
         let current = BASE_MODE | ENABLE_VIRTUAL_TERMINAL_INPUT;
-        let original = Some(BASE_MODE | ENABLE_VIRTUAL_TERMINAL_INPUT);
-        let result = compute_enable_raw_mode(current, original);
-        // The function doesn't strip existing VT bits (it may or may not set it again, doesn't matter).
+        let result = compute_enable_raw_mode(current);
         assert_ne!(
             result & ENABLE_VIRTUAL_TERMINAL_INPUT,
             0,
@@ -573,18 +514,16 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_enable_raw_mode_no_panic_when_original_unknown() {
-        // Exercise the pure helper's None behavior. With events enabled, the real
-        // enable_raw_mode path initializes the original mode before calling it.
+    fn test_compute_enable_raw_mode_preserves_raw_bits_only() {
         let current = BASE_MODE | NOT_RAW_MODE_MASK;
-        let result = compute_enable_raw_mode(current, None);
+        let result = compute_enable_raw_mode(current);
         assert_eq!(result & NOT_RAW_MODE_MASK, 0);
     }
 
     #[test]
     fn test_compute_disable_raw_mode_restores_not_raw_bits() {
         let current = BASE_MODE;
-        let result = compute_disable_raw_mode(current, None);
+        let result = compute_disable_raw_mode(current);
         assert_eq!(
             result & NOT_RAW_MODE_MASK,
             NOT_RAW_MODE_MASK,
@@ -593,22 +532,16 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_disable_raw_mode_clears_vt_when_original_lacked_it() {
+    fn test_compute_disable_raw_mode_keeps_existing_vt() {
         let current = BASE_MODE | ENABLE_VIRTUAL_TERMINAL_INPUT;
-        let original = Some(BASE_MODE); // crossterm enabled VT, so clear on exit
-        let result = compute_disable_raw_mode(current, original);
-        assert_eq!(
-            result & ENABLE_VIRTUAL_TERMINAL_INPUT,
-            0,
-            "VT input must be cleared on exit"
-        );
+        let result = compute_disable_raw_mode(current);
+        assert_ne!(result & ENABLE_VIRTUAL_TERMINAL_INPUT, 0);
     }
 
     #[test]
-    fn test_compute_disable_raw_mode_preserves_vt_when_original_had_it() {
+    fn test_compute_disable_raw_mode_preserves_vt_when_current_has_it() {
         let current = BASE_MODE | ENABLE_VIRTUAL_TERMINAL_INPUT;
-        let original = Some(BASE_MODE | ENABLE_VIRTUAL_TERMINAL_INPUT);
-        let result = compute_disable_raw_mode(current, original);
+        let result = compute_disable_raw_mode(current);
         assert_ne!(
             result & ENABLE_VIRTUAL_TERMINAL_INPUT,
             0,
@@ -617,38 +550,30 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_disable_raw_mode_no_panic_when_original_unknown() {
-        let current = BASE_MODE | ENABLE_VIRTUAL_TERMINAL_INPUT;
-        let result = compute_disable_raw_mode(current, None);
-        // When original is unknown we don't touch VT (safe default: leave it as-is)
-        assert_ne!(
-            result & ENABLE_VIRTUAL_TERMINAL_INPUT,
-            0,
-            "VT input left intact when original unknown"
-        );
+    fn test_compute_disable_raw_mode_preserves_vt_when_current_lacks_it() {
+        let current = BASE_MODE;
+        let result = compute_disable_raw_mode(current);
+        assert_eq!(result & ENABLE_VIRTUAL_TERMINAL_INPUT, 0);
     }
 
     #[test]
-    fn test_repeated_enable_disable_cycle_preserves_vt() {
-        // Simulate two raw mode cycles when original had no VT input.
-        let original = Some(BASE_MODE);
-        let starting = BASE_MODE;
+    fn test_repeated_raw_mode_cycle_preserves_vt() {
+        let starting = BASE_MODE | ENABLE_VIRTUAL_TERMINAL_INPUT;
 
         // First enable_raw_mode
-        let after_enable1 = compute_enable_raw_mode(starting, original);
+        let after_enable1 = compute_enable_raw_mode(starting);
         assert_ne!(after_enable1 & ENABLE_VIRTUAL_TERMINAL_INPUT, 0);
         // First disable_raw_mode
-        let after_disable1 = compute_disable_raw_mode(after_enable1, original);
-        assert_eq!(after_disable1 & ENABLE_VIRTUAL_TERMINAL_INPUT, 0);
-        // Second enable_raw_mode (the regression this patch fixes)
-        let after_enable2 = compute_enable_raw_mode(after_disable1, original);
+        let after_disable1 = compute_disable_raw_mode(after_enable1);
+        assert_ne!(after_disable1 & ENABLE_VIRTUAL_TERMINAL_INPUT, 0);
+        let after_enable2 = compute_enable_raw_mode(after_disable1);
         assert_ne!(
             after_enable2 & ENABLE_VIRTUAL_TERMINAL_INPUT,
             0,
-            "VT input must be re-enabled on second cycle"
+            "VT input must remain enabled on second cycle"
         );
         // Second disable_raw_mode
-        let after_disable2 = compute_disable_raw_mode(after_enable2, original);
-        assert_eq!(after_disable2 & ENABLE_VIRTUAL_TERMINAL_INPUT, 0);
+        let after_disable2 = compute_disable_raw_mode(after_enable2);
+        assert_ne!(after_disable2 & ENABLE_VIRTUAL_TERMINAL_INPUT, 0);
     }
 }

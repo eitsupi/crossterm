@@ -39,6 +39,40 @@ pub(crate) fn original_console_mode() -> std::io::Result<u32> {
         .map_err(|_| io::Error::other("Initial console modes not set"))
 }
 
+/// Enable VT input for a feature which emits VT input, preserving the original
+/// state for a later bracketed-paste disable. Raw mode intentionally does not
+/// call this function.
+pub(crate) fn enable_bracketed_paste() -> std::io::Result<()> {
+    let mode = ConsoleMode::from(Handle::current_in_handle()?);
+    let current = mode.mode()?;
+    init_original_console_mode(current);
+    if current & ENABLE_VIRTUAL_TERMINAL_INPUT == 0 {
+        mode.set_mode(current | ENABLE_VIRTUAL_TERMINAL_INPUT)?;
+    }
+    Ok(())
+}
+
+/// Restore only the VT-input bit captured before crossterm first changed the
+/// console mode. A disable without a snapshot is safe and intentionally leaves
+/// the console mode untouched.
+pub(crate) fn disable_bracketed_paste() -> std::io::Result<()> {
+    let original = match u32::try_from(ORIGINAL_CONSOLE_MODE.load(Ordering::Relaxed)) {
+        Ok(original) => original,
+        Err(_) => {
+            return Ok(());
+        }
+    };
+
+    let mode = ConsoleMode::from(Handle::current_in_handle()?);
+    let current = mode.mode()?;
+    let restored =
+        crate::terminal::sys::windows_mode::compute_restore_vt_input_mode(current, original);
+    if restored != current {
+        mode.set_mode(restored)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn enable_mouse_capture() -> std::io::Result<()> {
     let mode = ConsoleMode::from(Handle::current_in_handle()?);
     let current = mode.mode()?;

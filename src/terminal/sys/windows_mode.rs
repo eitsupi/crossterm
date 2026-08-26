@@ -1,6 +1,18 @@
 //! Platform-independent console mode bit manipulation.
 
 const ENABLE_MOUSE_MODE: u32 = 0x0010 | 0x0080 | 0x0008;
+const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
+pub(crate) const NOT_RAW_MODE_MASK: u32 = 0x0001 | 0x0002 | 0x0004;
+
+/// Compute the console mode used by raw mode while preserving every other bit.
+pub(crate) fn compute_enable_raw_mode(current: u32) -> u32 {
+    current & !NOT_RAW_MODE_MASK
+}
+
+/// Compute the console mode used when leaving raw mode while preserving every other bit.
+pub(crate) fn compute_disable_raw_mode(current: u32) -> u32 {
+    current | NOT_RAW_MODE_MASK
+}
 
 /// Compute the console mode to apply when disabling mouse capture.
 ///
@@ -14,9 +26,17 @@ pub(crate) fn compute_disable_mouse_capture_mode(current: u32, original: u32) ->
     (current & !ENABLE_MOUSE_MODE) | (original & ENABLE_MOUSE_MODE)
 }
 
+/// Restore only the VT-input bit from the first-touch mode snapshot.
+pub(crate) fn compute_restore_vt_input_mode(current: u32, original: u32) -> u32 {
+    (current & !ENABLE_VIRTUAL_TERMINAL_INPUT) | (original & ENABLE_VIRTUAL_TERMINAL_INPUT)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::compute_disable_mouse_capture_mode;
+    use super::{
+        NOT_RAW_MODE_MASK, compute_disable_mouse_capture_mode, compute_disable_raw_mode,
+        compute_enable_raw_mode, compute_restore_vt_input_mode,
+    };
 
     const ENABLE_MOUSE_INPUT: u32 = 0x0010;
     const ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
@@ -25,6 +45,75 @@ mod tests {
     const RAW_MODE_BITS: u32 = 0x0001 | 0x0002 | 0x0004;
     const UNRELATED_BITS: u32 = 0x4000;
     const ALL_MOUSE_BITS: u32 = ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS | ENABLE_WINDOW_INPUT;
+
+    #[test]
+    fn test_compute_restore_vt_input_mode_preserves_all_other_bits() {
+        let current = 0x4000 | ENABLE_MOUSE_INPUT | ENABLE_VIRTUAL_TERMINAL_INPUT;
+        let original = ENABLE_EXTENDED_FLAGS;
+        let result = compute_restore_vt_input_mode(current, original);
+        assert_eq!(result, 0x4000 | ENABLE_MOUSE_INPUT);
+    }
+
+    #[test]
+    fn test_compute_restore_vt_input_mode_restores_original_vt_state() {
+        let current = 0x4000;
+        assert_eq!(
+            compute_restore_vt_input_mode(current, ENABLE_VIRTUAL_TERMINAL_INPUT),
+            current | ENABLE_VIRTUAL_TERMINAL_INPUT
+        );
+        assert_eq!(
+            compute_restore_vt_input_mode(current | ENABLE_VIRTUAL_TERMINAL_INPUT, 0),
+            current
+        );
+    }
+
+    #[test]
+    fn test_raw_mode_only_changes_raw_bits() {
+        let current =
+            ENABLE_VIRTUAL_TERMINAL_INPUT | ALL_MOUSE_BITS | RAW_MODE_BITS | UNRELATED_BITS;
+        let enabled = compute_enable_raw_mode(current);
+        assert_eq!(
+            enabled,
+            ENABLE_VIRTUAL_TERMINAL_INPUT | ALL_MOUSE_BITS | UNRELATED_BITS
+        );
+        let disabled = compute_disable_raw_mode(enabled);
+        assert_eq!(
+            disabled,
+            ENABLE_VIRTUAL_TERMINAL_INPUT | ALL_MOUSE_BITS | RAW_MODE_BITS | UNRELATED_BITS
+        );
+    }
+
+    #[test]
+    fn test_raw_and_paste_transforms_compose_in_either_order() {
+        let original_off = NOT_RAW_MODE_MASK | ALL_MOUSE_BITS | UNRELATED_BITS;
+        let original_on = original_off | ENABLE_VIRTUAL_TERMINAL_INPUT;
+
+        for original in [original_off, original_on] {
+            // raw -> paste -> disable raw -> restore paste
+            let raw_then_paste = compute_enable_raw_mode(original) | ENABLE_VIRTUAL_TERMINAL_INPUT;
+            let raw_then_paste = compute_disable_raw_mode(raw_then_paste);
+            assert_eq!(
+                compute_restore_vt_input_mode(raw_then_paste, original),
+                original
+            );
+
+            // paste -> raw -> restore paste -> disable raw
+            let paste_then_raw = compute_enable_raw_mode(original | ENABLE_VIRTUAL_TERMINAL_INPUT);
+            let paste_then_raw = compute_restore_vt_input_mode(paste_then_raw, original);
+            assert_eq!(compute_disable_raw_mode(paste_then_raw), original);
+
+            // A paste disable/re-enable cycle restores the same snapshot.
+            let repasted = compute_restore_vt_input_mode(
+                compute_restore_vt_input_mode(
+                    compute_enable_raw_mode(original) | ENABLE_VIRTUAL_TERMINAL_INPUT,
+                    original,
+                ) | ENABLE_VIRTUAL_TERMINAL_INPUT,
+                original,
+            );
+            assert_eq!(repasted, compute_enable_raw_mode(original));
+            assert_eq!(compute_disable_raw_mode(repasted), original);
+        }
+    }
 
     #[test]
     fn test_compute_disable_mouse_capture_mode_clears_mouse_bits_missing_from_original() {

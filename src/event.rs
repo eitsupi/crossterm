@@ -132,6 +132,8 @@ use derive_more::derive::IsVariant;
 #[cfg(feature = "event-stream")]
 pub use stream::EventStream;
 
+#[cfg(windows)]
+use crate::command::WinApiAnsiTiming;
 use crate::{
     Command, csi,
     event::{filter::EventFilter, internal::InternalEvent},
@@ -336,8 +338,13 @@ impl Command for EnableMouseCapture {
     }
 
     #[cfg(windows)]
-    fn execute_winapi_before_ansi(&self) -> bool {
-        true
+    fn execute_winapi_with_ansi(&self) -> std::io::Result<()> {
+        sys::windows::enable_mouse_capture()
+    }
+
+    #[cfg(windows)]
+    fn winapi_ansi_timing(&self) -> WinApiAnsiTiming {
+        WinApiAnsiTiming::BeforeAnsi
     }
 }
 
@@ -372,8 +379,13 @@ impl Command for DisableMouseCapture {
     }
 
     #[cfg(windows)]
-    fn execute_winapi_before_ansi(&self) -> bool {
-        true
+    fn execute_winapi_with_ansi(&self) -> std::io::Result<()> {
+        sys::windows::disable_mouse_capture()
+    }
+
+    #[cfg(windows)]
+    fn winapi_ansi_timing(&self) -> WinApiAnsiTiming {
+        WinApiAnsiTiming::BeforeAnsi
     }
 }
 
@@ -419,6 +431,12 @@ impl Command for DisableFocusChange {
 ///
 /// This is not supported in older Windows terminals without
 /// [virtual terminal sequences](https://docs.microsoft.com/en-us/windows/console/console-virtual-terminal-sequences).
+///
+/// On Windows, enabling bracketed paste temporarily enables VT input for the
+/// lifetime of this paired command. Windows Terminal and ConPTY may not
+/// preserve key-release information while VT input is active. These paired
+/// commands are queue boundaries on Windows and are not reference-counted;
+/// callers must pair each enable with a disable without relying on nesting.
 #[cfg(feature = "bracketed-paste")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnableBracketedPaste;
@@ -436,9 +454,23 @@ impl Command for EnableBracketedPaste {
             "Bracketed paste not implemented in the legacy Windows API.",
         ))
     }
+
+    #[cfg(windows)]
+    fn execute_winapi_with_ansi(&self) -> std::io::Result<()> {
+        sys::windows::enable_bracketed_paste()
+    }
+
+    #[cfg(windows)]
+    fn winapi_ansi_timing(&self) -> WinApiAnsiTiming {
+        WinApiAnsiTiming::BeforeAnsiAndFlush
+    }
 }
 
 /// A command that disables bracketed paste mode.
+///
+/// On Windows, the ANSI disable sequence is flushed before VT input is
+/// restored. The command is paired with [`EnableBracketedPaste`] and is not
+/// reference-counted.
 #[cfg(feature = "bracketed-paste")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DisableBracketedPaste;
@@ -452,6 +484,16 @@ impl Command for DisableBracketedPaste {
     #[cfg(windows)]
     fn execute_winapi(&self) -> std::io::Result<()> {
         Ok(())
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi_with_ansi(&self) -> std::io::Result<()> {
+        sys::windows::disable_bracketed_paste()
+    }
+
+    #[cfg(windows)]
+    fn winapi_ansi_timing(&self) -> WinApiAnsiTiming {
+        WinApiAnsiTiming::AfterAnsiAndFlush
     }
 }
 
